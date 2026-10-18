@@ -681,6 +681,13 @@ class MOQTransportClient:
         # Counter distinguishing successive audio tracks. Bumped per
         # retirement; the name of track 0 is `audio_out_track` itself.
         self._audio_track_generation: int = 0
+        # Where the encoder's current epoch sits, and the samples written
+        # since. The encoder anchors an epoch on the first write after the
+        # track opens or ``reset_epoch()``, then derives every later PTS from
+        # the running sample count; these mirror that, so a write can report
+        # where its first sample landed. ``None`` until the next write anchors.
+        self._publish_epoch_us: int | None = None
+        self._publish_epoch_samples = 0
 
         # Track consumers we created so disconnect() can cancel them.
         # Each entry has a sync .cancel() method that terminates any
@@ -850,6 +857,7 @@ class MOQTransportClient:
             self._params.transcript_track, compression=True
         )
         self._audio_out = None
+        self._publish_epoch_us = None
         if self._audio_out_sample_rate is not None and self._params.audio_out_enabled:
             self._audio_out = self._publish_audio_track(self._audio_out_sample_rate)
         # Re-announce rebuilt broadcast (moq-rs 0.5 requires explicit
@@ -921,7 +929,7 @@ class MOQTransportClient:
         self._audio_track_generation += 1
         self._audio_out = self._publish_audio_track(self._audio_out_sample_rate)
 
-    async def publish_audio(self, audio: bytes):
+    async def publish_audio(self, audio: bytes) -> tuple[str, int] | None:
         """Push a PCM chunk to the bot's audio track with real PTS, paced to a cap.
 
         The library does the Opus encode + resample inside the FFI, so we
@@ -944,9 +952,13 @@ class MOQTransportClient:
         The track generation is captured before the pacing wait so a
         retirement while this call is asleep cannot land the abandoned
         chunk on the successor.
+
+        Returns:
+            The track the chunk was written to and the media timestamp of its
+            first sample in microseconds, or ``None`` if nothing was written.
         """
         if self._audio_out is None or not self._audio_out_sample_rate:
-            return
+            return None
         generation = self._audio_track_generation
 
         now = time.monotonic()
@@ -959,6 +971,7 @@ class MOQTransportClient:
             gap = None if self._publish_audio_clock is None else now - self._publish_audio_clock
             if gap is None or gap > _EPOCH_REANCHOR_MIN_GAP_S:
                 self._audio_out.reset_epoch()
+                self._publish_epoch_us = None
                 logger.debug(
                     f"MOQ: audio epoch re-anchored after "
                     f"{'first write' if gap is None else f'{gap:.3f}s gap'}"
@@ -978,15 +991,24 @@ class MOQTransportClient:
         # utterance that was just discarded, so drop it rather than letting
         # it anchor the successor track's epoch.
         if generation != self._audio_track_generation or self._audio_out is None:
-            return
+            return None
 
         # Advance the virtual clock and the presentation timestamp by the
         # duration of this chunk. S16 = 2 bytes/sample, mono.
         duration_s = len(audio) / (self._audio_out_sample_rate * 2)
         self._publish_audio_clock += duration_s
 
+        if self._publish_epoch_us is None:
+            self._publish_epoch_us = self._publish_pts_us
+            self._publish_epoch_samples = 0
+        timestamp_us = (
+            self._publish_epoch_us
+            + self._publish_epoch_samples * 1_000_000 // self._audio_out_sample_rate
+        )
         self._audio_out.write(moq.AudioFrame(timestamp_us=self._publish_pts_us, data=audio))
         self._publish_pts_us += int(duration_s * 1_000_000)
+        self._publish_epoch_samples += len(audio) // 2
+        return self._audio_track_name, timestamp_us
 
     async def wait_for_audio_drain(self, jitter_buffer_margin_s: float = 0.3) -> None:
         """Block until the pacing clock catches up to wall-clock, then a bit more.
@@ -2024,6 +2046,8 @@ class MOQOutputTransport(BaseOutputTransport):
         self,
         client: MOQTransportClient,
         params: MOQParams,
+        on_audio_published: Callable[[OutputAudioRawFrame, str, int], Awaitable[None]]
+        | None = None,
         **kwargs,
     ):
         """Initialize the MOQ output transport.
@@ -2031,11 +2055,15 @@ class MOQOutputTransport(BaseOutputTransport):
         Args:
             client: MOQTransportClient instance managing the MoQ session.
             params: MOQ transport configuration parameters.
+            on_audio_published: Called with each audio frame written, the track
+                it was written to, and the media timestamp of its first sample in
+                microseconds.
             **kwargs: Additional arguments passed to the parent class.
         """
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
+        self._on_audio_published = on_audio_published
 
     async def setup(self, setup: FrameProcessorSetup):
         """Forward setup to the shared MOQTransportClient so it can create tasks.
@@ -2141,11 +2169,13 @@ class MOQOutputTransport(BaseOutputTransport):
             True if the audio frame was written successfully, False otherwise.
         """
         try:
-            await self._client.publish_audio(frame.audio)
-            return True
+            published = await self._client.publish_audio(frame.audio)
         except Exception as e:
             logger.error(f"Error writing audio frame: {e}")
             return False
+        if published is not None and self._on_audio_published is not None:
+            await self._on_audio_published(frame, *published)
+        return True
 
 
 class MOQTransport(BaseTransport):
@@ -2179,6 +2209,10 @@ class MOQTransport(BaseTransport):
     - ``on_track_subscribed`` — remote track subscription succeeded
     - ``on_error`` — error in the underlying transport; receives the
       message and the exception
+    - ``on_audio_published`` — an audio frame was written to the bot's
+      audio track; receives the frame, the track name, and the media
+      timestamp of the frame's first sample in microseconds. It runs
+      before the frame continues downstream, so keep it fast
 
     A transport error also reaches the pipeline as an ``ErrorFrame`` from
     the input transport. A relay that refuses the dial on authentication
@@ -2240,6 +2274,8 @@ class MOQTransport(BaseTransport):
         self._register_event_handler("on_client_disconnected")
         self._register_event_handler("on_track_subscribed")
         self._register_event_handler("on_error")
+        # Inline, so a handler sees each frame before it continues downstream.
+        self._register_event_handler("on_audio_published", sync=True)
 
     def input(self) -> MOQInputTransport:
         """Get the input transport for receiving media."""
@@ -2250,7 +2286,12 @@ class MOQTransport(BaseTransport):
     def output(self) -> MOQOutputTransport:
         """Get the output transport for sending media."""
         if not self._output:
-            self._output = MOQOutputTransport(self._client, self._params, name=self._output_name)
+            self._output = MOQOutputTransport(
+                self._client,
+                self._params,
+                on_audio_published=self._on_audio_published,
+                name=self._output_name,
+            )
         return self._output
 
     @property
@@ -2273,6 +2314,10 @@ class MOQTransport(BaseTransport):
     # ------------------------------------------------------------------
     # MOQTransportClient callbacks.
     # ------------------------------------------------------------------
+
+    async def _on_audio_published(self, frame: OutputAudioRawFrame, track: str, timestamp_us: int):
+        """Handle an audio frame written to the bot's audio track."""
+        await self._call_event_handler("on_audio_published", frame, track, timestamp_us)
 
     async def _on_connected(self):
         """Handle a MOQ session (client or server) being established."""
