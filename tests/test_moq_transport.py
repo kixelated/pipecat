@@ -1097,6 +1097,19 @@ class TestPublishedAudioTimestamps(unittest.IsolatedAsyncioTestCase):
         anchored = client._publish_pts_us
         self.assertEqual(await client.publish_audio(b"\x00" * 480), ("bot-audio", anchored))
 
+    async def test_a_retired_tracks_successor_reports_under_its_own_name(self):
+        """A word timed after a barge-in lands on ``bot-audio-<n>``, at the
+        media time that was playing when the old track was retired."""
+        client = self._client_with_audio()
+        client._publish_broadcast.encode_audio.side_effect = lambda *a, **k: MagicMock()
+        await client.publish_audio(b"\x00" * 480)
+        client._publish_pts_us = 30_000_000
+        client._publish_audio_clock = time.monotonic() + 5.0
+        client.restart_audio_track()
+        track, timestamp_us = await client.publish_audio(b"\x00" * 480)
+        self.assertEqual(track, "bot-audio-1")
+        self.assertAlmostEqual(timestamp_us, 25_000_000, delta=100_000)
+
     async def test_nothing_written_reports_nothing(self):
         client, _stream = _client_with_fake_moq()
         self.assertIsNone(await client.publish_audio(b"\x00" * 480))
