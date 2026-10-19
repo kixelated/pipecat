@@ -649,6 +649,7 @@ class MOQTransportClient:
         self._publish_broadcast: moq.BroadcastProducer = self._publish_origin.create_broadcast(
             self._broadcast_path
         )
+        self._publish_route = moq.Route(epoch=moq.mint_epoch())
         # Lossless, ordered JSON append-log for RTVI (compression on). The
         # stream helper delivers every appended record in order — the
         # snapshot helper (publish_json_snapshot) would collapse to the
@@ -661,7 +662,7 @@ class MOQTransportClient:
         # transcript is that track, announce now. Audio on:
         # ``open_audio_track`` announces after adding the audio track.
         if not params.audio_out_enabled:
-            self._publish_broadcast.announce()
+            self._publish_broadcast.announce(self._publish_route)
         # Audio track is opened lazily once the pipeline's output sample
         # rate is known (in :meth:`open_audio_track`). We stash the rate
         # because ``publish_audio`` uses it to convert byte length to
@@ -794,7 +795,7 @@ class MOQTransportClient:
         # Announce broadcast to peers now that subscriber-needed tracks exist
         # (catalog via audio rendition above, transcript stream). moq-rs 0.5
         # requires explicit announce; until announced, broadcast is unroutable.
-        self._publish_broadcast.announce()
+        self._publish_broadcast.announce(self._publish_route)
 
     @property
     def _audio_track_name(self) -> str:
@@ -830,11 +831,10 @@ class MOQTransportClient:
     async def _rebuild_publish_side(self):
         """Replace the publish origin, broadcast and tracks before a redial.
 
-        The origin carries the publisher identity the relay sees. A redial
-        that re-announces under the identity of a publisher the relay still
-        holds a dead route for leaves the path stuck on that route, while a
-        new identity is parked until the dead route is reaped and then takes
-        the path over. The transcript log is replayed into the new stream
+        A rebuilt broadcast gets a fresh route epoch, so peers replace the
+        previous instance instead of resuming its cached groups. Re-announcing
+        the same broadcast keeps its epoch. The transcript log is replayed into
+        the new stream
         with its original ``seq`` and ``epoch``, so subscribers drop what
         they already have, and the audio track reopens at the same rate.
 
@@ -853,6 +853,7 @@ class MOQTransportClient:
                 pass
         self._publish_origin = moq.OriginProducer()
         self._publish_broadcast = self._publish_origin.create_broadcast(self._broadcast_path)
+        self._publish_route = moq.Route(epoch=moq.mint_epoch())
         self._transcript_out = self._publish_broadcast.publish_json_stream(
             self._params.transcript_track, compression=True
         )
@@ -862,7 +863,7 @@ class MOQTransportClient:
             self._audio_out = self._publish_audio_track(self._audio_out_sample_rate)
         # Re-announce rebuilt broadcast (moq-rs 0.5 requires explicit
         # announce; see open_audio_track).
-        self._publish_broadcast.announce()
+        self._publish_broadcast.announce(self._publish_route)
         # By index against the live log: a record published while the
         # replay yields is only logged (see publish_transcript), and is
         # written from here, after the records before it.

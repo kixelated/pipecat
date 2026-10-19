@@ -2461,3 +2461,30 @@ class TestMOQAudioTrackRestartLive(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBroadcastEpochs(unittest.IsolatedAsyncioTestCase):
+    """The broadcast instance, independently of its tracks, owns route identity."""
+
+    async def test_reannouncements_keep_identity_and_rebuild_renews_it(self):
+        client, _stream = _client_with_fake_moq()
+        client.open_audio_track(24000)
+        old = client._publish_broadcast
+        self.assertEqual(len(old.announce.call_args.args), 1)
+        first = old.announce.call_args.args[0]
+        self.assertIsNotNone(first.epoch)
+        client.open_audio_track(24000)
+        self.assertEqual(old.announce.call_args.args[0].epoch, first.epoch)
+        with patch.object(moq_transport.moq, "OriginProducer", side_effect=_fake_origin):
+            await client._rebuild_publish_side()
+        second = client._publish_broadcast.announce.call_args.args[0]
+        self.assertNotEqual(second.epoch, first.epoch)
+
+    async def test_transcript_only_instances_are_distinct(self):
+        a, _ = _client_with_fake_moq(MOQParams(audio_out_enabled=False))
+        b, _ = _client_with_fake_moq(MOQParams(audio_out_enabled=False))
+        calls = [client._publish_broadcast.announce.call_args for client in (a, b)]
+        for call in calls:
+            self.assertEqual(len(call.args), 1)
+            self.assertIsNotNone(call.args[0].epoch)
+        self.assertNotEqual(calls[0].args[0].epoch, calls[1].args[0].epoch)
