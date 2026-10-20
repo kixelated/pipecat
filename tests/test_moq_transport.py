@@ -2459,10 +2459,6 @@ class TestMOQAudioTrackRestartLive(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(updated.audio), {"bot-audio-1"})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestBroadcastEpochs(unittest.IsolatedAsyncioTestCase):
     """The broadcast instance, independently of its tracks, owns route identity."""
 
@@ -2488,3 +2484,7 @@ class TestBroadcastEpochs(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(call.args), 1)
             self.assertIsNotNone(call.args[0].epoch)
         self.assertNotEqual(calls[0].args[0].epoch, calls[1].args[0].epoch)
+
+
+if __name__ == "__main__":
+    unittest.main()
