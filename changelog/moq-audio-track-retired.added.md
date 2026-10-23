@@ -1,0 +1,1 @@
+- Added an `on_audio_track_retired` event to `MOQTransport`. It fires when an interruption retires the bot's audio track, with the retired track's name and how much audio it still held to be played, in microseconds, so an application can show what a barge-in discarded.

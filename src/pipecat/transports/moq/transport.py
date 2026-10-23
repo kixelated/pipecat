@@ -877,7 +877,7 @@ class MOQTransportClient:
         finally:
             self._transcript_replaying = False
 
-    def restart_audio_track(self):
+    def restart_audio_track(self) -> tuple[str, int] | None:
         """Re-anchor pacing, retiring the audio track if it still has audio to play.
 
         Called from :class:`MOQOutputTransport.process_frame` on
@@ -904,16 +904,21 @@ class MOQTransportClient:
         carries audio nobody has heard yet. ``_publish_audio_clock`` is
         the presentation deadline of the last chunk written, so its lead
         over wall-clock is exactly what is still to be played.
+
+        Returns:
+            The retired track's name and the audio it still held to be played,
+            in microseconds, or ``None`` if the track was kept.
         """
         clock = self._publish_audio_clock
         # The next write re-anchors pacing and the encoder's epoch to now.
         self._publish_audio_clock = None
         if self._audio_out is None or not self._audio_out_sample_rate or clock is None:
-            return
+            return None
         in_flight_s = clock - time.monotonic()
         if in_flight_s <= AUDIO_IN_FLIGHT_FLOOR_S:
-            return
+            return None
 
+        retired = self._audio_track_name
         old = self._audio_out
         # Cleared before finishing so a chunk still paced against the old
         # track can tell its write is no longer wanted (see publish_audio).
@@ -925,9 +930,11 @@ class MOQTransportClient:
             # is gone either way, so the new track is still worth opening.
             logger.debug(f"MOQ: finishing audio track {self._audio_track_name!r} failed: {e}")
 
-        self._publish_pts_us -= int(in_flight_s * 1_000_000)
+        in_flight_us = int(in_flight_s * 1_000_000)
+        self._publish_pts_us -= in_flight_us
         self._audio_track_generation += 1
         self._audio_out = self._publish_audio_track(self._audio_out_sample_rate)
+        return retired, in_flight_us
 
     async def publish_audio(self, audio: bytes) -> tuple[str, int] | None:
         """Push a PCM chunk to the bot's audio track with real PTS, paced to a cap.
@@ -2048,6 +2055,7 @@ class MOQOutputTransport(BaseOutputTransport):
         params: MOQParams,
         on_audio_published: Callable[[OutputAudioRawFrame, str, int], Awaitable[None]]
         | None = None,
+        on_audio_track_retired: Callable[[str, int], Awaitable[None]] | None = None,
         **kwargs,
     ):
         """Initialize the MOQ output transport.
@@ -2058,12 +2066,16 @@ class MOQOutputTransport(BaseOutputTransport):
             on_audio_published: Called with each audio frame written, the track
                 it was written to, and the media timestamp of its first sample in
                 microseconds.
+            on_audio_track_retired: Called when an interruption retires the
+                audio track, with the retired track's name and the audio it still
+                held to be played, in microseconds.
             **kwargs: Additional arguments passed to the parent class.
         """
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
         self._on_audio_published = on_audio_published
+        self._on_audio_track_retired = on_audio_track_retired
 
     async def setup(self, setup: FrameProcessorSetup):
         """Forward setup to the shared MOQTransportClient so it can create tasks.
@@ -2144,7 +2156,9 @@ class MOQOutputTransport(BaseOutputTransport):
         """
         await super().process_frame(frame, direction)
         if isinstance(frame, InterruptionFrame):
-            self._client.restart_audio_track()
+            retired = self._client.restart_audio_track()
+            if retired is not None and self._on_audio_track_retired is not None:
+                await self._on_audio_track_retired(*retired)
 
     async def send_message(
         self, frame: OutputTransportMessageFrame | OutputTransportMessageUrgentFrame
@@ -2213,6 +2227,10 @@ class MOQTransport(BaseTransport):
       audio track; receives the frame, the track name, and the media
       timestamp of the frame's first sample in microseconds. It runs
       before the frame continues downstream, so keep it fast
+    - ``on_audio_track_retired`` — an interruption retired the bot's audio
+      track; receives the retired track's name and the audio it still held
+      to be played, in microseconds. The successor's frames report their
+      own track name through ``on_audio_published``
 
     A transport error also reaches the pipeline as an ``ErrorFrame`` from
     the input transport. A relay that refuses the dial on authentication
@@ -2276,6 +2294,7 @@ class MOQTransport(BaseTransport):
         self._register_event_handler("on_error")
         # Inline, so a handler sees each frame before it continues downstream.
         self._register_event_handler("on_audio_published", sync=True)
+        self._register_event_handler("on_audio_track_retired", sync=True)
 
     def input(self) -> MOQInputTransport:
         """Get the input transport for receiving media."""
@@ -2290,6 +2309,7 @@ class MOQTransport(BaseTransport):
                 self._client,
                 self._params,
                 on_audio_published=self._on_audio_published,
+                on_audio_track_retired=self._on_audio_track_retired,
                 name=self._output_name,
             )
         return self._output
@@ -2318,6 +2338,10 @@ class MOQTransport(BaseTransport):
     async def _on_audio_published(self, frame: OutputAudioRawFrame, track: str, timestamp_us: int):
         """Handle an audio frame written to the bot's audio track."""
         await self._call_event_handler("on_audio_published", frame, track, timestamp_us)
+
+    async def _on_audio_track_retired(self, track: str, unplayed_us: int):
+        """Handle an interruption retiring the bot's audio track."""
+        await self._call_event_handler("on_audio_track_retired", track, unplayed_us)
 
     async def _on_connected(self):
         """Handle a MOQ session (client or server) being established."""

@@ -70,9 +70,15 @@ pytest.importorskip("moq")
 import moq  # noqa: E402
 
 import pipecat.transports.moq.transport as moq_transport  # noqa: E402
-from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame  # noqa: E402
+from pipecat.frames.frames import (  # noqa: E402
+    InputAudioRawFrame,
+    InterruptionFrame,
+    OutputAudioRawFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection  # noqa: E402
 from pipecat.runner.types import MOQRunnerArguments  # noqa: E402
 from pipecat.runner.utils import create_transport  # noqa: E402
+from pipecat.transports.base_output import BaseOutputTransport  # noqa: E402
 from pipecat.transports.moq.transport import (  # noqa: E402
     TRANSCRIPT_EPOCH_FIELD,
     TRANSCRIPT_SEQ_FIELD,
@@ -1130,6 +1136,28 @@ class TestPublishedAudioTimestamps(unittest.IsolatedAsyncioTestCase):
         frame = OutputAudioRawFrame(audio=b"\x00" * 480, sample_rate=24000, num_channels=1)
         self.assertTrue(await output.write_audio_frame(frame))
         self.assertEqual(seen, [(frame, "bot-audio", 1_234)])
+
+    async def test_a_retirement_reports_the_audio_it_discarded(self):
+        """Only an interruption that retires the track is reported, with the
+        retired track and how much of it was still to be played."""
+        with patch("pipecat.transports.moq.transport.moq"):
+            transport = MOQTransport(
+                params=MOQParams(audio_out_enabled=True), host="localhost", port=4080
+            )
+        output = transport.output()
+        transport._client.restart_audio_track = MagicMock(  # type: ignore[method-assign]
+            side_effect=[("bot-audio", 2_500_000), None]
+        )
+        seen = []
+
+        @transport.event_handler("on_audio_track_retired")
+        async def on_audio_track_retired(_transport, track, unplayed_us):
+            seen.append((track, unplayed_us))
+
+        with patch.object(BaseOutputTransport, "process_frame", AsyncMock()):
+            await output.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            await output.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        self.assertEqual(seen, [("bot-audio", 2_500_000)])
 
 
 # ----------------------------------------------------------------------
@@ -2353,8 +2381,10 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self._leave_audio_in_flight()
         retired = self.client._audio_out
 
-        self.client.restart_audio_track()
+        name, unplayed_us = self.client.restart_audio_track()
 
+        self.assertEqual(name, "bot-audio")
+        self.assertAlmostEqual(unplayed_us, 5_000_000, delta=100_000)
         retired.finish.assert_called_once()
         self.assertIsNotNone(self.client._audio_out)
         self.assertIsNot(self.client._audio_out, retired)
@@ -2395,7 +2425,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         kept = self.client._audio_out
         self._leave_audio_in_flight(0.1)
 
-        self.client.restart_audio_track()
+        self.assertIsNone(self.client.restart_audio_track())
 
         kept.finish.assert_not_called()
         self.assertIs(self.client._audio_out, kept)
