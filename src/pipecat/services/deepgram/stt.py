@@ -747,6 +747,22 @@ class DeepgramSTTService(STTService):
         """Handle a transcription result with tracing."""
         pass
 
+    async def _report_words(self, event: str, message: ListenV1Results):
+        """Raise ``event`` with the result's words, timed on the input audio's PTS."""
+        words = message.channel.alternatives[0].words or []
+        if words:
+            await self._call_event_handler(
+                event,
+                [
+                    (
+                        word.punctuated_word or word.word,
+                        self.sent_audio_pts(word.start),
+                        self.sent_audio_pts(word.end, end=True),
+                    )
+                    for word in words
+                ],
+            )
+
     async def _on_message(self, message):
         if isinstance(message, ListenV1Results):
             if not message.channel or len(message.channel.alternatives) == 0:
@@ -767,19 +783,7 @@ class DeepgramSTTService(STTService):
                     # Report usage before the transcription frame so tracing can
                     # attach it to the STT span the frame closes.
                     await self.emit_stt_usage_metrics()
-                    words = message.channel.alternatives[0].words or []
-                    if words:
-                        await self._call_event_handler(
-                            "on_word_timestamps",
-                            [
-                                (
-                                    word.punctuated_word or word.word,
-                                    self.sent_audio_pts(word.start),
-                                    self.sent_audio_pts(word.end, end=True),
-                                )
-                                for word in words
-                            ],
-                        )
+                    await self._report_words("on_word_timestamps", message)
                     await self.push_frame(
                         TranscriptionFrame(
                             transcript,
@@ -797,6 +801,7 @@ class DeepgramSTTService(STTService):
                     await self.stop_ttfb_metrics()
                     await self._cancel_ttfb_timeout()
             elif len(transcript) > 0:
+                await self._report_words("on_interim_word_timestamps", message)
                 # For interim transcriptions, just push the frame without tracing
                 await self.push_frame(
                     InterimTranscriptionFrame(

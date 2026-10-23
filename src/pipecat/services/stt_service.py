@@ -78,6 +78,9 @@ class STTService(AIService):
             ``(word, start, end)`` tuples, each the PTS in nanoseconds of the input
             audio it was spoken in, or ``None`` where that audio carried no PTS.
             Raised by services that report word times; see :meth:`record_sent_audio`.
+        on_interim_word_timestamps: Called with the words of an interim transcript,
+            shaped like ``on_word_timestamps``. A later interim or final transcript
+            may revise them.
 
     Example::
 
@@ -98,6 +101,12 @@ class STTService(AIService):
             stt: STTService, words: list[tuple[str, int | None, int | None]]
         ):
             logger.debug(f"STT words: {words}")
+
+        @stt.event_handler("on_interim_word_timestamps")
+        async def on_interim_word_timestamps(
+            stt: STTService, words: list[tuple[str, int | None, int | None]]
+        ):
+            logger.debug(f"STT interim words: {words}")
     """
 
     _settings: STTSettings
@@ -209,6 +218,7 @@ class STTService(AIService):
         self._register_event_handler("on_connection_error")
         # Inline, so handlers see a transcript's words before its frame moves on.
         self._register_event_handler("on_word_timestamps", sync=True)
+        self._register_event_handler("on_interim_word_timestamps", sync=True)
 
         # Audio sent on the current provider stream, for mapping word times back
         # to the input's PTS, and the frame whose audio run_stt is sending.
