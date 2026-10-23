@@ -557,3 +557,35 @@ async def test_each_connection_starts_a_new_timeline():
     await service._connection_handler()
 
     assert service._sent_audio.to_pts(0.0) is None
+
+
+@pytest.mark.asyncio
+async def test_interim_words_are_reported_apart_from_final_words(monkeypatch):
+    """An interim result's words go to their own event, on the same PTS
+    mapping, and never to the final words' event."""
+    from pipecat.frames.frames import InputAudioRawFrame
+
+    service = DeepgramSTTService(api_key="test-key", sample_rate=16000)
+    service._setup = frame_processor_setup(TaskManager())
+    service._sample_rate = 16000
+    service._connection = MagicMock(send_media=AsyncMock())
+    monkeypatch.setattr(service, "push_frame", AsyncMock())
+    interim, final = [], []
+
+    @service.event_handler("on_interim_word_timestamps")
+    async def on_interim_word_timestamps(_service, words):
+        interim.append(words)
+
+    @service.event_handler("on_word_timestamps")
+    async def on_word_timestamps(_service, words):
+        final.append(words)
+
+    frame = InputAudioRawFrame(audio=b"\x00\x00" * 320, sample_rate=16000, num_channels=1)
+    frame.pts = 1_000_000_000
+    await service.process_audio_frame(frame, FrameDirection.DOWNSTREAM)
+
+    await service._on_message(
+        _results_message("hi", is_final=False, words=[_word("hi", 0.005, 0.01)])
+    )
+    assert interim == [[("hi", 1_005_000_000, 1_010_000_000)]]
+    assert final == []

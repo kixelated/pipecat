@@ -1,0 +1,1 @@
+- Added an `on_interim_word_timestamps` event to `STTService`, raised by `DeepgramSTTService` with the words of each interim transcript, timed on the input audio's PTS like `on_word_timestamps`, so an application can tell when a word was first heard from when it was final.
