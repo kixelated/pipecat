@@ -24,6 +24,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import IntEnum
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -420,9 +421,9 @@ class MOQParams(TransportParams):
             one through the catalog rather than by this name.
         transcript_track: Name of the bot's outgoing transcript track. A
             fixed-name JSON stream track carrying RTVI messages as a
-            lossless, ordered append-log (moq's ``publish_json_stream`` /
-            ``subscribe_json_stream``, compression on), discovered by
-            convention rather than via the catalog.
+            lossless, ordered append-log (``moq.json.StreamProducer`` /
+            ``StreamConsumer``, compression on), subscribed by this
+            well-known name rather than found through a catalog rendition.
         verify_ssl: Verify the relay's TLS certificate. Client mode only.
         client_tls_cert: Path to a PEM-encoded client certificate chain to
             present when dialing. Client mode only, and only needed by a
@@ -649,14 +650,8 @@ class MOQTransportClient:
         self._publish_broadcast: moq.BroadcastProducer = self._publish_origin.create_broadcast(
             self._broadcast_path
         )
-        # Lossless, ordered JSON append-log for RTVI (compression on). The
-        # stream helper delivers every appended record in order — the
-        # snapshot helper (publish_json_snapshot) would collapse to the
-        # latest value and drop events a slow consumer fell behind on.
-        self._transcript_out: moq.JsonStreamProducer = self._publish_broadcast.publish_json_stream(
-            params.transcript_track, compression=True
-        )
-        # moq-rs 0.5 routes only announced broadcasts, and the announce
+        self._transcript_out: moq.json.StreamProducer = self._open_transcript()
+        # moq-rs routes only announced broadcasts, and the announce
         # belongs after the last track a configuration creates. Audio off:
         # transcript is that track, announce now. Audio on:
         # ``open_audio_track`` announces after adding the audio track.
@@ -666,7 +661,7 @@ class MOQTransportClient:
         # rate is known (in :meth:`open_audio_track`). We stash the rate
         # because ``publish_audio`` uses it to convert byte length to
         # wall-clock duration for pacing.
-        self._audio_out: moq.AudioProducer | None = None
+        self._audio_out: moq.audio.Producer | None = None
         self._audio_out_sample_rate: int | None = None
         # Wall-clock target for the next publish_audio write. ``None``
         # means "reset" — the next write anchors to ``time.monotonic()``.
@@ -683,7 +678,7 @@ class MOQTransportClient:
         self._audio_track_generation: int = 0
         # Where the encoder's current epoch sits, and the samples written
         # since. The encoder anchors an epoch on the first write after the
-        # track opens or ``reset_epoch()``, then derives every later PTS from
+        # track opens or ``reanchor()``, then derives every later PTS from
         # the running sample count; these mirror that, so a write can report
         # where its first sample landed. ``None`` until the next write anchors.
         self._publish_epoch_us: int | None = None
@@ -792,7 +787,7 @@ class MOQTransportClient:
         self._audio_out_sample_rate = sample_rate
         self._audio_out = self._publish_audio_track(sample_rate)
         # Announce broadcast to peers now that subscriber-needed tracks exist
-        # (catalog via audio rendition above, transcript stream). moq-rs 0.5
+        # (catalog via audio rendition above, transcript stream). moq-rs
         # requires explicit announce; until announced, broadcast is unroutable.
         self._publish_broadcast.announce()
 
@@ -803,7 +798,17 @@ class MOQTransportClient:
             return self._params.audio_out_track
         return f"{self._params.audio_out_track}-{self._audio_track_generation}"
 
-    def _publish_audio_track(self, sample_rate: int) -> "moq.AudioProducer":
+    def _open_transcript(self) -> "moq.json.StreamProducer":
+        """Open the RTVI transcript on the current publish broadcast.
+
+        A lossless, ordered JSON append-log (compression on). The stream
+        delivers every appended record in order; a snapshot would collapse to
+        the latest value and drop events a slow consumer fell behind on.
+        """
+        track = self._publish_broadcast.publish_track(self._params.transcript_track)
+        return moq.json.StreamProducer(self._publish_broadcast, track, compression=True)
+
+    def _publish_audio_track(self, sample_rate: int) -> "moq.audio.Producer":
         """Open the bot's Opus audio track on the current publish broadcast."""
         logger.debug(
             f"MOQ: publishing audio as Opus "
@@ -811,19 +816,18 @@ class MOQTransportClient:
             f"frame={self._params.audio_out_frame_ms}ms, "
             f"track={self._audio_track_name!r})"
         )
-        return self._publish_broadcast.encode_audio(
-            self._audio_track_name,
-            moq.AudioEncoderInput(
-                format=moq.AudioSampleFormat.S16,
+        return moq.audio.Producer(
+            moq.media.CatalogProducer(self._publish_broadcast),
+            moq.audio.EncoderInput(
+                format=moq.audio.SampleFormat.S16,
                 sample_rate=sample_rate,
                 channels=1,
             ),
-            moq.AudioEncoderOutput(
-                codec=moq.AudioCodec.opus(),
+            moq.audio.EncoderOutput(
+                codec=moq.audio.Codec.opus(),
+                track=self._audio_track_name,
                 sample_rate=OPUS_SAMPLE_RATE,
-                channels=None,
-                bitrate=None,
-                frame_duration_us=self._params.audio_out_frame_ms * 1000,
+                frame_duration=timedelta(milliseconds=self._params.audio_out_frame_ms),
             ),
         )
 
@@ -844,23 +848,15 @@ class MOQTransportClient:
         """
         # The session that carried these is gone; finishing them is
         # best-effort tidiness.
-        for producer in (self._audio_out, self._transcript_out, self._publish_broadcast):
-            if producer is None:
-                continue
-            try:
-                producer.finish()
-            except Exception:
-                pass
+        self._finish_published()
         self._publish_origin = moq.OriginProducer()
         self._publish_broadcast = self._publish_origin.create_broadcast(self._broadcast_path)
-        self._transcript_out = self._publish_broadcast.publish_json_stream(
-            self._params.transcript_track, compression=True
-        )
+        self._transcript_out = self._open_transcript()
         self._audio_out = None
         self._publish_epoch_us = None
         if self._audio_out_sample_rate is not None and self._params.audio_out_enabled:
             self._audio_out = self._publish_audio_track(self._audio_out_sample_rate)
-        # Re-announce rebuilt broadcast (moq-rs 0.5 requires explicit
+        # Re-announce rebuilt broadcast (moq-rs requires explicit
         # announce; see open_audio_track).
         self._publish_broadcast.announce()
         # By index against the live log: a record published while the
@@ -977,7 +973,7 @@ class MOQTransportClient:
             # compounding per turn).
             gap = None if self._publish_audio_clock is None else now - self._publish_audio_clock
             if gap is None or gap > _EPOCH_REANCHOR_MIN_GAP_S:
-                self._audio_out.reset_epoch()
+                self._audio_out.reanchor()
                 self._publish_epoch_us = None
                 logger.debug(
                     f"MOQ: audio epoch re-anchored after "
@@ -1012,7 +1008,9 @@ class MOQTransportClient:
             self._publish_epoch_us
             + self._publish_epoch_samples * 1_000_000 // self._audio_out_sample_rate
         )
-        self._audio_out.write(moq.AudioFrame(timestamp_us=self._publish_pts_us, data=audio))
+        self._audio_out.write(
+            moq.audio.Frame(timestamp=timedelta(microseconds=self._publish_pts_us), data=audio)
+        )
         self._publish_pts_us += int(duration_s * 1_000_000)
         self._publish_epoch_samples += len(audio) // 2
         return self._audio_track_name, timestamp_us
@@ -1478,7 +1476,7 @@ class MOQTransportClient:
             return moq.Server(
                 self._bind,
                 publish=publish_origin,
-                subscribe=subscribe_origin,
+                consume=subscribe_origin,
                 **tls_kwargs,
             )
 
@@ -1503,7 +1501,7 @@ class MOQTransportClient:
             # ``_is_unauthorized`` reads.
             reconnect=False,
             publish=publish_origin,
-            subscribe=subscribe_origin,
+            consume=subscribe_origin,
             **client_tls,
         )
 
@@ -1652,7 +1650,7 @@ class MOQTransportClient:
         # tracks ending, not as a transport failure.
         catalog = None
         try:
-            catalog_sub = self._track(await peer_broadcast.subscribe_catalog())
+            catalog_sub = self._track(await moq.media.CatalogConsumer.subscribe(peer_broadcast))
             async with asyncio.timeout(self._params.connection_timeout):
                 async for next_catalog in catalog_sub:
                     if next_catalog.audio:
@@ -1712,14 +1710,15 @@ class MOQTransportClient:
 
         try:
             consumer = self._track(
-                await peer_broadcast.decode_audio(
+                await moq.audio.Consumer.subscribe(
+                    peer_broadcast,
                     track_name,
                     audio,
-                    moq.AudioDecoderOutput(
-                        format=moq.AudioSampleFormat.S16,
+                    moq.audio.DecoderOutput(
+                        format=moq.audio.SampleFormat.S16,
                         sample_rate=target_rate,
                         channels=source_channels,
-                        max_age_us=self._params.audio_in_max_latency_ms * 1000,
+                        max_delay=timedelta(milliseconds=self._params.audio_in_max_latency_ms),
                     ),
                 )
             )
@@ -1729,7 +1728,9 @@ class MOQTransportClient:
                     pcm = frame.data
                     if source_channels > 1:
                         pcm = _downmix_s16_to_mono(pcm, source_channels)
-                    await self._callbacks.on_audio_received(pcm, target_rate, frame.timestamp_us)
+                    await self._callbacks.on_audio_received(
+                        pcm, target_rate, frame.timestamp // timedelta(microseconds=1)
+                    )
         except asyncio.CancelledError:
             pass
         except _MoqError as e:
@@ -1742,8 +1743,8 @@ class MOQTransportClient:
 
         Symmetric with the bot's own ``transcript`` stream (see
         :meth:`publish_transcript`): the client appends each RTVI message
-        as a record on the JSON stream; the ``subscribe_json_stream``
-        consumer yields them, already parsed, in order — every message,
+        as a record on the JSON stream; the ``moq.json.StreamConsumer``
+        yields them, already parsed, in order — every message,
         losslessly. Delivered via :attr:`MOQCallbacks.on_message_received`,
         which :class:`MOQTransport` wires to push an
         :class:`InputTransportMessageFrame` into the pipeline, handled by
@@ -1756,10 +1757,10 @@ class MOQTransportClient:
         logger.debug(f"MOQ: subscribing to peer transcript {track_name!r}")
         dropped = 0
         try:
-            consumer = self._track(
-                await peer_broadcast.subscribe_json_stream(track_name, compression=True)
-            )
-            async for record in consumer:
+            track = await peer_broadcast.subscribe_track(track_name)
+            consumer = self._track(moq.json.StreamConsumer(track, compression=True))
+            async for timed in consumer:
+                record = timed.value
                 if not isinstance(record, dict):
                     logger.warning(
                         f"MOQ: expected RTVI object on transcript stream, got {type(record).__name__}"
@@ -1830,6 +1831,30 @@ class MOQTransportClient:
         self._active_consumers.append(consumer)
         return consumer
 
+    def _finish_published(self):
+        """Finish what this transport published before dropping it.
+
+        ``finish()`` on the audio track flushes samples still inside the
+        encoder, and closing the broadcast unannounces it; a dropped producer
+        is instead lingered by the origin, so the relay keeps advertising a
+        dead bot to anyone browsing the namespace until it expires. Tracks
+        first, then the broadcast that carries them.
+        """
+        for producer, what in (
+            (self._audio_out, "audio track"),
+            (self._transcript_out, "transcript stream"),
+        ):
+            if producer is None:
+                continue
+            try:
+                producer.finish()
+            except Exception as e:
+                logger.debug(f"MOQ: finishing the {what} raised: {e}")
+        try:
+            self._publish_broadcast.close()
+        except Exception as e:
+            logger.debug(f"MOQ: closing the broadcast raised: {e}")
+
     async def disconnect(self):
         """Disconnect from the MOQ relay.
 
@@ -1854,23 +1879,7 @@ class MOQTransportClient:
         # Cancel any open consumers so their async iterations terminate.
         self._cancel_consumers()
 
-        # Finish what we published before dropping it. ``finish()`` on the
-        # audio track flushes samples still inside the encoder, and
-        # finishing the broadcast unannounces it — a dropped producer is
-        # instead lingered by the origin, so the relay keeps advertising a
-        # dead bot to anyone browsing the namespace until it expires.
-        # Tracks first, then the broadcast that carries them.
-        for producer, what in (
-            (self._audio_out, "audio track"),
-            (self._transcript_out, "transcript stream"),
-            (self._publish_broadcast, "broadcast"),
-        ):
-            if producer is None:
-                continue
-            try:
-                producer.finish()
-            except Exception as e:
-                logger.debug(f"MOQ: finishing the {what} raised: {e}")
+        self._finish_published()
         self._audio_out = None
 
         if self._connection_task is not None and self._task_manager is not None:

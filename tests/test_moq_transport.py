@@ -57,6 +57,7 @@ import asyncio
 import itertools
 import time
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -598,16 +599,18 @@ class TestMOQTransportInit(unittest.TestCase):
 
         # A broadcast is created ON an origin, so patch the origin and observe
         # what __init__ asks it for without standing up an actual broadcast.
-        with patch("pipecat.transports.moq.transport.moq") as moq_mock:
-            broadcast = MagicMock(name="broadcast")
-            track = MagicMock(name="transcript_stream")
-            broadcast.publish_json_stream.return_value = track
-            origin = MagicMock(name="publish_origin")
-            origin.create_broadcast.return_value = broadcast
-            moq_mock.OriginProducer.return_value = origin
+        patcher = patch("pipecat.transports.moq.transport.moq")
+        moq_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        broadcast = MagicMock(name="broadcast")
+        track = MagicMock(name="transcript_stream")
+        moq_mock.json.StreamProducer.return_value = track
+        origin = MagicMock(name="publish_origin")
+        origin.create_broadcast.return_value = broadcast
+        moq_mock.OriginProducer.return_value = origin
 
-            transport = MOQTransport(params=params, host="localhost", port=4080)
-            return transport, broadcast, track, moq_mock
+        transport = MOQTransport(params=params, host="localhost", port=4080)
+        return transport, broadcast, track, moq_mock
 
     def test_publish_broadcast_created_synchronously(self):
         """The bot's broadcast producer exists immediately after
@@ -626,9 +629,12 @@ class TestMOQTransportInit(unittest.TestCase):
         on the output transport appends RTVI messages into it, and that can
         happen before ``_run()`` finishes dialing. Compression is on (the
         ``.z`` suffix)."""
-        transport, broadcast, track, _moq = self._make_transport()
+        transport, broadcast, track, moq_mock = self._make_transport()
         self.assertIs(transport._client._transcript_out, track)
-        broadcast.publish_json_stream.assert_called_once_with("transcript.json.z", compression=True)
+        broadcast.publish_track.assert_called_once_with("transcript.json.z")
+        moq_mock.json.StreamProducer.assert_called_once_with(
+            broadcast, broadcast.publish_track.return_value, compression=True
+        )
 
     def test_audio_track_is_lazy(self):
         """The audio track, by contrast, is intentionally lazy. We don't
@@ -641,7 +647,7 @@ class TestMOQTransportInit(unittest.TestCase):
         broadcast.publish_audio.assert_not_called()
 
     def test_audio_on_defers_the_announce_to_open_audio_track(self):
-        """moq-rs 0.5 routes only announced broadcasts, and the announce
+        """moq-rs routes only announced broadcasts, and the announce
         belongs after the last track a configuration creates — with audio
         on, the audio track ``open_audio_track`` adds."""
         transport, broadcast, _track, _moq = self._make_transport()
@@ -926,13 +932,30 @@ class TestIsNormalClose(unittest.TestCase):
 
 
 def _fake_origin(**_kwargs):
-    """A stand-in ``moq.OriginProducer`` whose broadcast hands out mock producers."""
+    """A stand-in ``moq.OriginProducer`` whose broadcast is a mock."""
     origin = MagicMock(name="origin")
-    broadcast = MagicMock(name="broadcast")
-    broadcast.publish_json_stream.return_value = MagicMock(name="transcript_stream")
-    broadcast.publish_audio.return_value = MagicMock(name="audio_track")
-    origin.create_broadcast.return_value = broadcast
+    origin.create_broadcast.return_value = MagicMock(name="broadcast")
     return origin
+
+
+def _mock_producers(test: unittest.TestCase) -> SimpleNamespace:
+    """Replace moq's JSON and audio producers with mocks for the rest of ``test``.
+
+    They wrap the broadcast's native handle, so a mock broadcast needs mock
+    producers too. Each audio producer is a fresh mock, as each real one is.
+    """
+    patches = {
+        "transcript": patch.object(moq_transport.moq.json, "StreamProducer"),
+        "audio": patch.object(
+            moq_transport.moq.audio, "Producer", side_effect=lambda *a, **k: MagicMock()
+        ),
+        "catalog": patch.object(moq_transport.moq.media, "CatalogProducer"),
+    }
+    mocks = {}
+    for name, p in patches.items():
+        mocks[name] = p.start()
+        test.addCleanup(p.stop)
+    return SimpleNamespace(**mocks)
 
 
 def _client_with_fake_moq(params: MOQParams | None = None, url: str = "https://relay/moq"):
@@ -951,11 +974,12 @@ def _client_with_fake_moq(params: MOQParams | None = None, url: str = "https://r
         on_audio_received=AsyncMock(),
         on_message_received=AsyncMock(),
     )
-    with patch.object(moq_transport.moq, "OriginProducer") as origin_cls:
-        stream = MagicMock(name="transcript_stream")
-        broadcast = MagicMock(name="broadcast")
-        broadcast.publish_json_stream.return_value = stream
-        origin_cls.return_value.create_broadcast.return_value = broadcast
+    stream = MagicMock(name="transcript_stream")
+    with (
+        patch.object(moq_transport.moq, "OriginProducer") as origin_cls,
+        patch.object(moq_transport.moq.json, "StreamProducer", return_value=stream),
+    ):
+        origin_cls.return_value.create_broadcast.return_value = MagicMock(name="broadcast")
         client = MOQTransportClient(params=params, url=url, bind=None, callbacks=callbacks)
     return client, stream
 
@@ -1034,7 +1058,7 @@ class TestTranscriptRecords(unittest.TestCase):
 
 
 class TestEpochReanchor(unittest.IsolatedAsyncioTestCase):
-    """``reset_epoch`` drops the encoder's pending samples and lookahead
+    """``reanchor`` drops the encoder's pending samples and lookahead
     and publishes a discontinuity, so a mid-utterance delivery stall must
     not trip it; only the first write and a real idle gap re-anchor."""
 
@@ -1047,19 +1071,19 @@ class TestEpochReanchor(unittest.IsolatedAsyncioTestCase):
     async def test_first_write_re_anchors(self):
         client = self._client_with_audio()
         await client.publish_audio(b"\x00" * 480)
-        client._audio_out.reset_epoch.assert_called_once()
+        client._audio_out.reanchor.assert_called_once()
 
     async def test_a_delivery_stall_does_not_re_anchor(self):
         client = self._client_with_audio()
         client._publish_audio_clock = time.monotonic() - 0.1
         await client.publish_audio(b"\x00" * 480)
-        client._audio_out.reset_epoch.assert_not_called()
+        client._audio_out.reanchor.assert_not_called()
 
     async def test_an_idle_gap_re_anchors(self):
         client = self._client_with_audio()
         client._publish_audio_clock = time.monotonic() - 1.0
         await client.publish_audio(b"\x00" * 480)
-        client._audio_out.reset_epoch.assert_called_once()
+        client._audio_out.reanchor.assert_called_once()
 
 
 class TestPublishedAudioTimestamps(unittest.IsolatedAsyncioTestCase):
@@ -1098,6 +1122,7 @@ class TestPublishedAudioTimestamps(unittest.IsolatedAsyncioTestCase):
     async def test_a_rebuilt_track_reports_from_its_own_epoch(self):
         client = self._client_with_audio()
         await client.publish_audio(b"\x00" * 480)
+        _mock_producers(self)
         with patch.object(moq_transport.moq, "OriginProducer"):
             await client._rebuild_publish_side()
         anchored = client._publish_pts_us
@@ -1107,7 +1132,7 @@ class TestPublishedAudioTimestamps(unittest.IsolatedAsyncioTestCase):
         """A word timed after a barge-in lands on ``bot-audio-<n>``, at the
         media time that was playing when the old track was retired."""
         client = self._client_with_audio()
-        client._publish_broadcast.encode_audio.side_effect = lambda *a, **k: MagicMock()
+        _mock_producers(self)
         await client.publish_audio(b"\x00" * 480)
         client._publish_pts_us = 30_000_000
         client._publish_audio_clock = time.monotonic() + 5.0
@@ -1299,6 +1324,7 @@ class TestClientReconnect(unittest.IsolatedAsyncioTestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+        self.producers = _mock_producers(self)
 
     def _make_client(self, **params) -> MOQTransportClient:
         client, _stream = _client_with_fake_moq(
@@ -1634,7 +1660,9 @@ class TestClientReconnect(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call.args[0]["seq"] for call in new_stream.append.call_args_list], [0, 1])
         self.assertEqual(new_stream.append.call_args_list[1].args[0]["type"], "b")
         self.assertIsNot(client._audio_out, old_audio)
-        client._publish_broadcast.encode_audio.assert_called_once()
+        # Opened once on the first broadcast, reopened once on the rebuilt one.
+        self.assertEqual(self.producers.audio.call_count, 2)
+        self.assertIs(self.producers.catalog.call_args.args[0], client._publish_broadcast)
 
     async def test_peer_tracks_ending_without_goodbye_redial_and_the_peer_comes_back(self):
         """A relay between the peers failing ends the peer's tracks the way a
@@ -1747,11 +1775,34 @@ class TestClientReconnect(unittest.IsolatedAsyncioTestCase):
         cb.on_error.assert_not_awaited()
 
 
+def _route_peer_subscriptions(test: unittest.TestCase):
+    """Route moq's peer subscriptions to the fake peer broadcast for the rest of ``test``.
+
+    The catalog and audio consumers are built from a broadcast's native handle,
+    so they are answered by the fake's ``catalog`` and ``audio`` mocks instead,
+    and the JSON consumer is the fake track ``subscribe_track`` returns.
+    """
+
+    async def catalog(broadcast):
+        return await broadcast.catalog()
+
+    async def audio(broadcast, *args):
+        return await broadcast.audio(*args)
+
+    for p in (
+        patch.object(moq_transport.moq.media.CatalogConsumer, "subscribe", new=catalog),
+        patch.object(moq_transport.moq.audio.Consumer, "subscribe", new=audio),
+        patch.object(moq_transport.moq.json, "StreamConsumer", new=lambda track, **_: track),
+    ):
+        p.start()
+        test.addCleanup(p.stop)
+
+
 class _FakeJsonStream:
-    """Stands in for a ``JsonStreamConsumer``: yields scripted records, then ends."""
+    """Stands in for a ``moq.json.StreamConsumer``: yields scripted records, then ends."""
 
     def __init__(self, records):
-        self._records = list(records)
+        self._records = [moq.json.Timed(record, None) for record in records]
 
     def __aiter__(self):
         return self
@@ -1996,10 +2047,13 @@ class TestPeerGoodbye(unittest.IsolatedAsyncioTestCase):
     """The peer's session-ending marker is read off its transcript stream and
     never reaches the pipeline."""
 
+    def setUp(self):
+        _route_peer_subscriptions(self)
+
     async def test_marker_sets_goodbye_and_is_not_forwarded(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_json_stream = AsyncMock(
+        peer_broadcast.subscribe_track = AsyncMock(
             return_value=_FakeJsonStream(
                 [
                     {"label": "rtvi-ai", "type": "client-ready", "seq": 0, "epoch": "e"},
@@ -2018,7 +2072,7 @@ class TestPeerGoodbye(unittest.IsolatedAsyncioTestCase):
     async def test_tracks_ending_without_the_marker_leave_goodbye_unset(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_json_stream = AsyncMock(
+        peer_broadcast.subscribe_track = AsyncMock(
             return_value=_FakeJsonStream([{"label": "rtvi-ai", "type": "client-ready"}])
         )
 
@@ -2055,6 +2109,9 @@ class TestSubscribeRefusedAsPeerGone(unittest.IsolatedAsyncioTestCase):
     subscription itself. That is the peer's tracks ending, which the session
     loop answers with a retry and then a redial, not a transport failure."""
 
+    def setUp(self):
+        _route_peer_subscriptions(self)
+
     DROPPED = moq.Error.Protocol(
         moq.ProtocolError(
             scope=moq.ErrorScope.STREAM,
@@ -2067,30 +2124,30 @@ class TestSubscribeRefusedAsPeerGone(unittest.IsolatedAsyncioTestCase):
     async def test_a_refused_catalog_subscribe_ends_the_audio_pump(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_catalog = AsyncMock(side_effect=self.DROPPED)
+        peer_broadcast.catalog = AsyncMock(side_effect=self.DROPPED)
         await client._forward_peer_audio(peer_broadcast)
-        peer_broadcast.decode_audio.assert_not_called()
+        peer_broadcast.audio.assert_not_called()
 
     async def test_a_refused_audio_subscribe_ends_the_audio_pump(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
-        peer_broadcast.decode_audio = AsyncMock(side_effect=self.DROPPED)
+        peer_broadcast.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
+        peer_broadcast.audio = AsyncMock(side_effect=self.DROPPED)
         await client._forward_peer_audio(peer_broadcast)
-        peer_broadcast.decode_audio.assert_awaited_once()
+        peer_broadcast.audio.assert_awaited_once()
 
     async def test_a_refused_transcript_subscribe_ends_the_transcript_pump(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_json_stream = AsyncMock(side_effect=self.DROPPED)
+        peer_broadcast.subscribe_track = AsyncMock(side_effect=self.DROPPED)
         await client._forward_peer_transcript(peer_broadcast)
         client._callbacks.on_message_received.assert_not_awaited()
 
     async def test_any_other_subscribe_error_still_propagates(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_catalog = AsyncMock(side_effect=moq.Error.Protocol("boom"))
-        with self.assertRaises(moq.Error.Protocol):
+        peer_broadcast.catalog = AsyncMock(side_effect=moq.Error.Internal("boom"))
+        with self.assertRaises(moq.Error.Internal):
             await client._forward_peer_audio(peer_broadcast)
 
     async def test_the_session_is_dropped_for_a_fresh_one_rather_than_failed(self):
@@ -2101,8 +2158,8 @@ class TestSubscribeRefusedAsPeerGone(unittest.IsolatedAsyncioTestCase):
         client._task_manager = TaskManager()
         client._peer_connected = True
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_catalog = AsyncMock(side_effect=self.DROPPED)
-        peer_broadcast.subscribe_json_stream = AsyncMock(side_effect=self.DROPPED)
+        peer_broadcast.catalog = AsyncMock(side_effect=self.DROPPED)
+        peer_broadcast.subscribe_track = AsyncMock(side_effect=self.DROPPED)
         origin = MagicMock(name="subscribe_origin")
         origin.consume.return_value.announced_broadcast.side_effect = lambda _path: _FakeAnnounced(
             peer_broadcast
@@ -2110,7 +2167,7 @@ class TestSubscribeRefusedAsPeerGone(unittest.IsolatedAsyncioTestCase):
         with patch.object(moq_transport, "_PEER_DATA_GRACE_S", 0.05):
             gone = await asyncio.wait_for(client._consume_peer(origin), timeout=2)
         self.assertFalse(gone)
-        peer_broadcast.subscribe_json_stream.assert_awaited_once()
+        peer_broadcast.subscribe_track.assert_awaited_once()
         client._callbacks.on_error.assert_not_awaited()
 
 
@@ -2139,11 +2196,14 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
     with a fresh one. That is the peer's tracks ending: the session loop
     subscribes again rather than failing the transport."""
 
+    def setUp(self):
+        _route_peer_subscriptions(self)
+
     async def test_cancelled_audio_ends_the_audio_pump(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
-        peer_broadcast.decode_audio = AsyncMock(
+        peer_broadcast.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
+        peer_broadcast.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
                 [MagicMock(data=b"\x00\x01" * 160)], moq.Error.Audio("moq: cancelled")
             )
@@ -2159,21 +2219,25 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         client._task_manager = TaskManager()
         client._peer_connected = True
         first = MagicMock(name="first_broadcast")
-        first.subscribe_catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
-        first.decode_audio = AsyncMock(
+        first.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
+        first.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
                 [MagicMock(data=b"\x00\x01" * 160)], moq.Error.Audio("moq: cancelled")
             )
         )
-        first.subscribe_json_stream = AsyncMock(
+        first.subscribe_track = AsyncMock(
             return_value=_FakeTrackEndingWith(
-                [{"label": "rtvi-ai", "type": "client-ready", "seq": 0, "epoch": "e1"}],
+                [
+                    moq.json.Timed(
+                        {"label": "rtvi-ai", "type": "client-ready", "seq": 0, "epoch": "e1"}, None
+                    )
+                ],
                 _RELAY_CANCEL,
             )
         )
         fresh = MagicMock(name="fresh_broadcast")
-        fresh.subscribe_catalog = AsyncMock(return_value=_FakeCatalogs([]))
-        fresh.subscribe_json_stream = AsyncMock(
+        fresh.catalog = AsyncMock(return_value=_FakeCatalogs([]))
+        fresh.subscribe_track = AsyncMock(
             return_value=_FakeJsonStream(
                 [
                     {"label": "rtvi-ai", "type": "client-message", "seq": 0, "epoch": "e2"},
@@ -2189,7 +2253,7 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         gone = await asyncio.wait_for(client._consume_peer(origin), timeout=2)
         self.assertTrue(gone)
         self.assertTrue(client._peer_goodbye)
-        fresh.subscribe_json_stream.assert_awaited_once()
+        fresh.subscribe_track.assert_awaited_once()
         client._callbacks.on_audio_received.assert_awaited_once()
         self.assertEqual(client._callbacks.on_message_received.await_count, 2)
         client._callbacks.on_error.assert_not_awaited()
@@ -2199,17 +2263,20 @@ class TestReceivedAudioCarriesMediaTime(unittest.IsolatedAsyncioTestCase):
     """Received audio keeps the peer's media timestamp, so a processor can place
     it on the peer's track timeline across decode gaps."""
 
+    def setUp(self):
+        _route_peer_subscriptions(self)
+
     async def test_the_pump_forwards_each_frames_timestamp(self):
         client, _stream = _client_with_fake_moq()
         peer_broadcast = MagicMock()
-        peer_broadcast.subscribe_catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
+        peer_broadcast.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
         pcm = b"\x00\x01" * 160
-        peer_broadcast.decode_audio = AsyncMock(
+        peer_broadcast.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
                 [
-                    SimpleNamespace(data=pcm, timestamp_us=1_000_000),
+                    SimpleNamespace(data=pcm, timestamp=timedelta(microseconds=1_000_000)),
                     # A skipped group leaves a gap the timestamps keep.
-                    SimpleNamespace(data=pcm, timestamp_us=1_060_000),
+                    SimpleNamespace(data=pcm, timestamp=timedelta(microseconds=1_060_000)),
                 ],
                 moq.Error.Audio("moq: cancelled"),
             )
@@ -2353,8 +2420,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patcher.stop)
 
         self.broadcast = MagicMock(name="broadcast")
-        self.broadcast.publish_json_stream.return_value = MagicMock(name="transcript_stream")
-        self.broadcast.encode_audio.side_effect = lambda *a, **k: MagicMock(name="audio_producer")
+        self.moq.audio.Producer.side_effect = lambda *a, **k: MagicMock(name="audio_producer")
         origin = MagicMock(name="publish_origin")
         origin.create_broadcast.return_value = self.broadcast
         self.moq.OriginProducer.return_value = origin
@@ -2363,7 +2429,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.client = MOQTransport(params=params, host="localhost", port=4080)._client
 
     def _published_track_names(self):
-        return [call.args[0] for call in self.broadcast.encode_audio.call_args_list]
+        return [call.kwargs["track"] for call in self.moq.audio.EncoderOutput.call_args_list]
 
     def _leave_audio_in_flight(self, seconds: float = 5.0):
         """Park the pacing clock ahead of wall-clock, as a live utterance does.
@@ -2412,9 +2478,9 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.client.restart_audio_track()
         await self.client.publish_audio(b"\x00" * 320)
 
-        anchor = self.moq.AudioFrame.call_args.kwargs["timestamp_us"]
-        self.assertAlmostEqual(anchor, 25_000_000, delta=100_000)
-        self.client._audio_out.reset_epoch.assert_called_once()
+        anchor = self.moq.audio.Frame.call_args.kwargs["timestamp"]
+        self.assertAlmostEqual(anchor, timedelta(seconds=25), delta=timedelta(milliseconds=100))
+        self.client._audio_out.reanchor.assert_called_once()
 
     def test_restart_without_audio_in_flight_keeps_the_track(self):
         """Interruptions are broadcast on every user turn, so most of them find
@@ -2439,7 +2505,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.client.restart_audio_track()
 
         self.assertIsNone(self.client._audio_out)
-        self.broadcast.encode_audio.assert_not_called()
+        self.moq.audio.Producer.assert_not_called()
 
     async def test_a_chunk_paced_against_a_retired_track_is_dropped(self):
         """Pacing can park a chunk in a sleep for seconds, long enough for the
@@ -2478,7 +2544,9 @@ class TestMOQAudioTrackRestartLive(unittest.IsolatedAsyncioTestCase):
         """finish() drops the retired rendition and the successor publishes
         its own, so the catalog always names exactly one audio track."""
         self.client.open_audio_track(16000)
-        catalog = await self.client._publish_broadcast.consume().subscribe_catalog()
+        catalog = await moq.media.CatalogConsumer.subscribe(
+            self.client._publish_broadcast.consume()
+        )
         first = await asyncio.wait_for(anext(catalog), timeout=2)
         self.assertEqual(set(first.audio), {"bot-audio"})
 

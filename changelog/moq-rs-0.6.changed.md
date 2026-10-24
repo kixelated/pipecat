@@ -1,0 +1,1 @@
+- `MOQTransport` now requires `moq-rs` 0.6. It publishes audio through `moq.audio.Producer` and the transcript through `moq.json.StreamProducer`, and reads the peer through `moq.media.CatalogConsumer`, `moq.audio.Consumer` and `moq.json.StreamConsumer`, since 0.6 removed the broadcast-level helpers 0.5 offered.
