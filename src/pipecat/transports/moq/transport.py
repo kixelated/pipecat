@@ -1320,6 +1320,11 @@ class MOQTransportClient:
                 for task in (closed, consume, stalled):
                     if not task.done():
                         await self._task_manager.cancel_task(task)
+                # What this session published stays open for the next dial or
+                # the bot's own teardown, so the drain a clean exit from
+                # ``moq.Client`` runs could only time out, and would raise
+                # over the outcome decided above.
+                session.cancel(0)
 
     async def _session_closed(self, session: "moq.Session"):
         """Return when the session is closed by either side, however it closed."""

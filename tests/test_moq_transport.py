@@ -1246,8 +1246,12 @@ class _FakeSession:
     def __init__(self, closed: bool = False, error: Exception | None = None):
         self._closed = asyncio.Event()
         self._error = error
+        self.cancelled: list[int] = []
         if closed:
             self._closed.set()
+
+    def cancel(self, code: int):
+        self.cancelled.append(code)
 
     async def closed(self):
         await self._closed.wait()
@@ -1663,6 +1667,23 @@ class TestClientReconnect(unittest.IsolatedAsyncioTestCase):
         # Opened once on the first broadcast, reopened once on the rebuilt one.
         self.assertEqual(self.producers.audio.call_count, 2)
         self.assertIs(self.producers.catalog.call_args.args[0], client._publish_broadcast)
+
+    async def test_a_session_is_cancelled_rather_than_drained_when_left(self):
+        """``moq.Client`` drains a session it exits cleanly, which cannot finish
+        while the broadcast this transport publishes is still open: it times
+        out and raises over the peer having left. Leaving cancels instead."""
+        first, second = _FakeSession(), _FakeSession()
+        self.script[:] = [first, second]
+        client = self._make_client()
+        self._peer_leaves_after(client, sessions_seen=2)
+        run = asyncio.create_task(client._run())
+        await self._wait_for_dials(1)
+        first.drop()
+        await asyncio.wait_for(run, timeout=2)
+
+        self.assertEqual(first.cancelled, [0])
+        self.assertEqual(second.cancelled, [0])
+        client._callbacks.on_error.assert_not_awaited()
 
     async def test_peer_tracks_ending_without_goodbye_redial_and_the_peer_comes_back(self):
         """A relay between the peers failing ends the peer's tracks the way a
