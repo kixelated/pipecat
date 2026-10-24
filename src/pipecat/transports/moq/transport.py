@@ -1267,7 +1267,8 @@ class MOQTransportClient:
         logger.debug(f"MOQ: connecting to {self._url_for_logs} as {self._broadcast_path}")
         async with self._make_transport(self._publish_origin, subscribe_origin) as client:
             session = cast(moq.Client, client).session
-            assert session is not None, "moq.Client exposes its session once connected"
+            assert session is not None, "moq.Client exposes its session once entered"
+            await self._session_connected(session)
             if self._connected_once:
                 # The outage ends when the peer is back, not here: a relay
                 # that accepts the dial and closes the session at once
@@ -1322,6 +1323,21 @@ class MOQTransportClient:
                 # ``moq.Client`` runs could only time out, and would raise
                 # over the outcome decided above.
                 session.cancel(0)
+
+    async def _session_connected(self, session: "moq.Session"):
+        """Wait for the dial to finish, raising what refused it.
+
+        ``moq.Client`` hands over the session while it is still dialing.
+        With ``once=True`` a failed dial closes it for good, and
+        ``closed()`` raises the failure (a refused token among them).
+        """
+        state = session.state()
+        while state.phase == moq.ConnectionPhase.CONNECTING:
+            state = await session.state_changed(state.revision)
+        if state.phase == moq.ConnectionPhase.CONNECTED:
+            return
+        await session.closed()
+        raise ConnectionError(f"MOQ: session closed before connecting ({state.phase})")
 
     async def _session_closed(self, session: "moq.Session"):
         """Return when the session is closed by either side, however it closed."""
@@ -1484,27 +1500,25 @@ class MOQTransportClient:
 
         # ``bind`` is optional here: unset dials from an ephemeral source
         # port; set pins a specific local address/port.
-        client_tls: dict = {}
-        if self._params.client_tls_cert and self._params.client_tls_key:
-            client_tls["tls_cert"] = self._params.client_tls_cert
-            client_tls["tls_key"] = self._params.client_tls_key
-        if self._params.client_tls_roots:
-            client_tls["tls_roots"] = self._params.client_tls_roots
-        if self._params.client_tls_fingerprints:
-            client_tls["tls_fingerprints"] = self._params.client_tls_fingerprints
+        mtls = bool(self._params.client_tls_cert and self._params.client_tls_key)
         return moq.Client(
             self._url,
-            tls_verify=self._params.verify_ssl,
+            tls=moq.ClientTls(
+                insecure=not self._params.verify_ssl,
+                roots=self._params.client_tls_roots or (),
+                fingerprints=self._params.client_tls_fingerprints or (),
+                cert=self._params.client_tls_cert if mtls else None,
+                key=self._params.client_tls_key if mtls else None,
+            ),
             bind=self._bind,
             # This transport owns retry: ``_run_client`` redials with
             # backoff, a stall watchdog, and a fresh publisher per dial.
             # The library's own reconnect wraps a refused session's close
             # in a retry-timeout error, hiding the code
             # ``_is_unauthorized`` reads.
-            reconnect=False,
+            once=True,
             publish=publish_origin,
             consume=subscribe_origin,
-            **client_tls,
         )
 
     async def _consume_peer(self, origin: "moq.OriginProducer") -> bool:

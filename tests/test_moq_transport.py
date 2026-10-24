@@ -717,56 +717,66 @@ class TestMOQTransportInit(unittest.TestCase):
         relay — it isn't ignored."""
         self.assertEqual(self._bind_for(serve=False, bind="[::]:9000"), "[::]:9000")
 
-    def _client_kwargs(self, **params):
-        """The kwargs ``_make_transport`` hands ``moq.Client`` in client mode."""
+    def _client_mocks(self, **params):
+        """The mocked ``moq`` module after ``_make_transport`` dials in client mode."""
         p = MOQParams(audio_in_enabled=True, audio_out_enabled=True, serve=False, **params)
         with patch("pipecat.transports.moq.transport.moq") as moq_mock:
             moq_mock.BroadcastProducer.return_value = MagicMock()
             transport = MOQTransport(params=p, host="localhost", port=4080)
             client = transport._client
             client._make_transport(MagicMock(), MagicMock())
-            return moq_mock.Client.call_args.kwargs
+            return moq_mock
+
+    def _client_kwargs(self, **params):
+        """The kwargs ``_make_transport`` hands ``moq.Client`` in client mode."""
+        return self._client_mocks(**params).Client.call_args.kwargs
+
+    def _tls_kwargs(self, **params):
+        """The kwargs ``_make_transport`` hands ``moq.ClientTls`` in client mode."""
+        return self._client_mocks(**params).ClientTls.call_args.kwargs
 
     def test_client_cert_is_presented_when_both_halves_are_set(self):
         """A relay that authenticates its peers with mTLS needs the client
         cert; without it the dial is anonymous and the relay tiers it as an
         ordinary connection."""
-        kwargs = self._client_kwargs(client_tls_cert="/c.pem", client_tls_key="/k.pem")
-        self.assertEqual(kwargs["tls_cert"], "/c.pem")
-        self.assertEqual(kwargs["tls_key"], "/k.pem")
+        kwargs = self._tls_kwargs(client_tls_cert="/c.pem", client_tls_key="/k.pem")
+        self.assertEqual(kwargs["cert"], "/c.pem")
+        self.assertEqual(kwargs["key"], "/k.pem")
 
     def test_no_client_cert_by_default(self):
-        kwargs = self._client_kwargs()
-        self.assertNotIn("tls_cert", kwargs)
-        self.assertNotIn("tls_key", kwargs)
+        kwargs = self._tls_kwargs()
+        self.assertIsNone(kwargs["cert"])
+        self.assertIsNone(kwargs["key"])
 
     def test_half_a_client_cert_is_ignored(self):
         """A cert without its key can't be loaded, so passing one alone would
         fail the dial rather than degrade to anonymous."""
-        self.assertNotIn("tls_cert", self._client_kwargs(client_tls_cert="/c.pem"))
-        self.assertNotIn("tls_key", self._client_kwargs(client_tls_key="/k.pem"))
+        self.assertIsNone(self._tls_kwargs(client_tls_cert="/c.pem")["cert"])
+        self.assertIsNone(self._tls_kwargs(client_tls_key="/k.pem")["key"])
 
     def test_custom_roots_and_pins_are_passed_through(self):
         """Both are alternatives to switching ``verify_ssl`` off: a private CA
         and a self-signed relay can each be verified rather than trusted
         blindly."""
-        kwargs = self._client_kwargs(
-            client_tls_roots=["/ca.pem"], client_tls_fingerprints=["ab:cd"]
-        )
-        self.assertEqual(kwargs["tls_roots"], ["/ca.pem"])
-        self.assertEqual(kwargs["tls_fingerprints"], ["ab:cd"])
+        kwargs = self._tls_kwargs(client_tls_roots=["/ca.pem"], client_tls_fingerprints=["ab:cd"])
+        self.assertEqual(kwargs["roots"], ["/ca.pem"])
+        self.assertEqual(kwargs["fingerprints"], ["ab:cd"])
 
     def test_no_roots_or_pins_by_default(self):
-        kwargs = self._client_kwargs()
-        self.assertNotIn("tls_roots", kwargs)
-        self.assertNotIn("tls_fingerprints", kwargs)
+        kwargs = self._tls_kwargs()
+        self.assertFalse(kwargs["roots"])
+        self.assertFalse(kwargs["fingerprints"])
+
+    def test_verify_ssl_off_skips_verification(self):
+        self.assertFalse(self._tls_kwargs()["insecure"])
+        self.assertTrue(self._tls_kwargs(verify_ssl=False)["insecure"])
 
     def test_library_reconnect_is_off(self):
         """The transport owns retry (``_run_client``'s redial with backoff,
         stall watchdog, fresh publisher per dial); the library's reconnect
         wraps a refused session's close in a retry-timeout error, hiding
         the code ``_is_unauthorized`` reads."""
-        self.assertIs(self._client_kwargs()["reconnect"], False)
+        self.assertIs(self._client_kwargs()["once"], True)
 
     def test_deprecated_serve_bind_still_sets_the_bind(self):
         """Pydantic drops unknown fields, so without the alias a bot that
@@ -1241,14 +1251,26 @@ class TestRunnerRelayUrl(unittest.IsolatedAsyncioTestCase):
 
 
 class _FakeSession:
-    """A dialed session that closes when the test says so, with or without an error."""
+    """A dialed session that closes when the test says so, with or without an error.
 
-    def __init__(self, closed: bool = False, error: Exception | None = None):
+    Like ``moq.Client``'s, it is handed over still connecting, and connects
+    on the first wait unless the dial failed (``refused``).
+    """
+
+    def __init__(self, closed: bool = False, error: Exception | None = None, refused: bool = False):
         self._closed = asyncio.Event()
         self._error = error
+        self._refused = refused
         self.cancelled: list[int] = []
         if closed:
             self._closed.set()
+
+    def state(self):
+        return SimpleNamespace(phase=moq.ConnectionPhase.CONNECTING, revision=0)
+
+    async def state_changed(self, after: int):
+        phase = moq.ConnectionPhase.CLOSED if self._refused else moq.ConnectionPhase.CONNECTED
+        return SimpleNamespace(phase=phase, revision=after + 1)
 
     def cancel(self, code: int):
         self.cancelled.append(code)
@@ -1276,7 +1298,8 @@ class _FakeClient:
     """Stands in for ``moq.Client``: each dial takes the next scripted outcome.
 
     An outcome is a :class:`_FakeSession` (the dial succeeds and yields it)
-    or an exception (the dial raises it). Every dial's URL is recorded.
+    or an exception (the dial fails with it, closing the session it yields).
+    Every dial's URL is recorded.
     """
 
     def __init__(self, script: list, dials: list, url: str, **kwargs):
@@ -1289,7 +1312,7 @@ class _FakeClient:
         self._dials.append(self._url)
         outcome = self._script.pop(0)
         if isinstance(outcome, BaseException):
-            raise outcome
+            outcome = _FakeSession(closed=True, error=outcome, refused=True)
         self.session = outcome
         return self
 
