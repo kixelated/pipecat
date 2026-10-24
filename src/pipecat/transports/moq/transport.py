@@ -825,10 +825,10 @@ class MOQTransportClient:
             ),
             moq.audio.EncoderOutput(
                 codec=moq.audio.Codec.opus(),
-                track=self._audio_track_name,
                 sample_rate=OPUS_SAMPLE_RATE,
                 frame_duration=timedelta(milliseconds=self._params.audio_out_frame_ms),
             ),
+            track=self._audio_track_name,
         )
 
     async def _rebuild_publish_side(self):
@@ -884,10 +884,13 @@ class MOQTransportClient:
         so anything still arriving on the old one is recognizably stale
         rather than indistinguishable from the new utterance's first frame.
 
-        ``finish()`` drops the producer's catalog rendition, and the new
-        track publishes its own, so the catalog always advertises exactly
-        one audio track and subscribers follow the swap through normal
-        rendition selection.
+        The retired producer is dropped, not finished: a finished track
+        keeps its catalog rendition until the broadcast ends, while a
+        dropped one leaves the catalog and ends its track with an error,
+        which suits audio nobody should play. The new track publishes its
+        own rendition, so the catalog always advertises exactly one audio
+        track and subscribers follow the swap through normal rendition
+        selection.
 
         The successor continues the timeline from the media time playing
         now rather than from where the abandoned utterance had written
@@ -915,16 +918,10 @@ class MOQTransportClient:
             return None
 
         retired = self._audio_track_name
-        old = self._audio_out
-        # Cleared before finishing so a chunk still paced against the old
-        # track can tell its write is no longer wanted (see publish_audio).
+        # Releasing the last reference drops the producer. A chunk still
+        # paced against the old track holds its own until it sees the
+        # track is no longer wanted (see publish_audio).
         self._audio_out = None
-        try:
-            old.finish()
-        except Exception as e:
-            # A peer that already went away fails the flush; the rendition
-            # is gone either way, so the new track is still worth opening.
-            logger.debug(f"MOQ: finishing audio track {self._audio_track_name!r} failed: {e}")
 
         in_flight_us = int(in_flight_s * 1_000_000)
         self._publish_pts_us -= in_flight_us

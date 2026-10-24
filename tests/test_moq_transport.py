@@ -2450,7 +2450,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.client = MOQTransport(params=params, host="localhost", port=4080)._client
 
     def _published_track_names(self):
-        return [call.kwargs["track"] for call in self.moq.audio.EncoderOutput.call_args_list]
+        return [call.kwargs["track"] for call in self.moq.audio.Producer.call_args_list]
 
     def _leave_audio_in_flight(self, seconds: float = 5.0):
         """Park the pacing clock ahead of wall-clock, as a live utterance does.
@@ -2461,9 +2461,10 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.client._publish_audio_clock = time.monotonic() + seconds
 
     def test_interruption_retires_the_track_and_publishes_a_successor(self):
-        """The old producer is finished, which drops its catalog rendition,
-        and a differently-named track takes its place, so the catalog still
-        advertises exactly one audio track for subscribers to follow."""
+        """The old producer is dropped, not finished, which drops its catalog
+        rendition, and a differently-named track takes its place, so the
+        catalog still advertises exactly one audio track for subscribers to
+        follow."""
         self.client.open_audio_track(16000)
         self._leave_audio_in_flight()
         retired = self.client._audio_out
@@ -2472,7 +2473,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(name, "bot-audio")
         self.assertAlmostEqual(unplayed_us, 5_000_000, delta=100_000)
-        retired.finish.assert_called_once()
+        retired.finish.assert_not_called()
         self.assertIsNotNone(self.client._audio_out)
         self.assertIsNot(self.client._audio_out, retired)
         self.assertEqual(self._published_track_names(), ["bot-audio", "bot-audio-1"])
@@ -2562,8 +2563,9 @@ class TestMOQAudioTrackRestartLive(unittest.IsolatedAsyncioTestCase):
         self.client = MOQTransport(params=params, host="localhost", port=4080)._client
 
     async def test_catalog_advertises_the_replacement_track(self):
-        """finish() drops the retired rendition and the successor publishes
-        its own, so the catalog always names exactly one audio track."""
+        """Dropping the retired producer drops its rendition and the successor
+        publishes its own, so the catalog always names exactly one audio
+        track. A finished one would stay listed until the broadcast ends."""
         self.client.open_audio_track(16000)
         catalog = await moq.media.CatalogConsumer.subscribe(
             self.client._publish_broadcast.consume()
