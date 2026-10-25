@@ -624,6 +624,8 @@ class MOQTransportClient:
         self._callbacks = callbacks
 
         self._connection_task: asyncio.Task | None = None
+        self._session: moq.Session | None = None
+        self._disconnecting = False
         # Shared task manager, wired in by the input/output processors'
         # setup() forwarding. Owns the serve-loop task in _run().
         self._task_manager: BaseTaskManager | None = None
@@ -1104,6 +1106,7 @@ class MOQTransportClient:
             else:
                 await self._run_client()
         finally:
+            self._session = None
             self._audio_out = None
             self._cert_fingerprints = []
             if self._session_up or not self._session_reported:
@@ -1199,6 +1202,8 @@ class MOQTransportClient:
                 error = e
                 peer_left = False
 
+            if self._disconnecting:
+                return
             if peer_left:
                 await self._report_peer_gone()
                 return
@@ -1269,6 +1274,7 @@ class MOQTransportClient:
             session = cast(moq.Client, client).session
             assert session is not None, "moq.Client exposes its session once entered"
             await self._session_connected(session)
+            self._session = session
             if self._connected_once:
                 # The outage ends when the peer is back, not here: a relay
                 # that accepts the dial and closes the session at once
@@ -1318,11 +1324,11 @@ class MOQTransportClient:
                 for task in (closed, consume, stalled):
                     if not task.done():
                         await self._task_manager.cancel_task(task)
-                # What this session published stays open for the next dial or
-                # the bot's own teardown, so the drain a clean exit from
-                # ``moq.Client`` runs could only time out, and would raise
-                # over the outcome decided above.
-                session.cancel(0)
+                self._session = None
+                # Reconnects keep their publications open. Only disconnect()
+                # finishes them and waits for a draining close.
+                if not self._disconnecting:
+                    session.cancel(0)
 
     async def _session_connected(self, session: "moq.Session"):
         """Wait for the dial to finish, raising what refused it.
@@ -1880,15 +1886,19 @@ class MOQTransportClient:
         drain its jitter buffer, and close the audio decoder cleanly —
         without that heads-up, WebTransport just vanishes underneath
         Chrome's WebCodecs decoder and can crash the renderer ("Aw snap").
+        Client mode finishes its published tracks and awaits their session's
+        delivery result before stopping the connection task. Serve mode keeps
+        its notification grace without promising a session drain.
         """
-        # Best-effort: publish the shutdown marker while the transcript
-        # stream is still alive, then yield briefly so the frame has time
-        # to reach the wire before we cancel _run. 250ms is well under
-        # any interactive perception threshold.
+        self._disconnecting = True
+        session = self._session
         try:
             if hasattr(self, "_transcript_out") and self._transcript_out is not None:
                 self.publish_transcript({"label": "moq-transport", "type": "session-ending"})
-                await asyncio.sleep(0.25)
+                # Serve mode owns its accepted sessions inside Server.serve();
+                # its notification grace is independent of client drain.
+                if self._params.serve:
+                    await asyncio.sleep(0.25)
         except Exception as e:
             logger.debug(f"MOQ: could not send session-ending notification: {e}")
 
@@ -1898,9 +1908,14 @@ class MOQTransportClient:
         self._finish_published()
         self._audio_out = None
 
-        if self._connection_task is not None and self._task_manager is not None:
-            await self._task_manager.cancel_task(self._connection_task)
-            self._connection_task = None
+        try:
+            if session is not None:
+                session.shutdown()
+                await session.closed()
+        finally:
+            if self._connection_task is not None and self._task_manager is not None:
+                await self._task_manager.cancel_task(self._connection_task)
+                self._connection_task = None
 
     async def cleanup(self):
         """Unconditionally tear down the underlying MOQ connection.
