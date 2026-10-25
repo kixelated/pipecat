@@ -1691,6 +1691,47 @@ class TestClientReconnect(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.producers.audio.call_count, 2)
         self.assertIs(self.producers.catalog.call_args.args[0], client._publish_broadcast)
 
+    async def test_disconnect_waits_for_finished_delivery_and_reports_its_failure(self):
+        """A local close waits for its transport drain without redialing."""
+        for failure in (None, ValueError("delivery failed")):
+            with self.subTest(failure=failure):
+                session = _FakeSession()
+                shutdown = asyncio.Event()
+                session.shutdown = shutdown.set
+                self.script[:] = [session]
+                client = self._make_client()
+                self._peer_stays(client)
+                connected = asyncio.Event()
+                client._callbacks.on_connected = AsyncMock(side_effect=connected.set)
+                client.connect()
+                await connected.wait()
+                dials = len(self.dials)
+                closing = asyncio.create_task(client.disconnect())
+                requested = asyncio.create_task(shutdown.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {closing, requested}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    self.assertIn(requested, done, "disconnect must request a session drain")
+                    self.assertFalse(closing.done(), "close returned before delivery completed")
+                    self.assertEqual(session.cancelled, [])
+                    client._transcript_out.finish.assert_called_once()
+                    client._publish_broadcast.close.assert_called_once()
+                    session.drop(failure)
+                    if failure is None:
+                        await closing
+                    else:
+                        with self.assertRaisesRegex(ValueError, "delivery failed"):
+                            await closing
+                    self.assertEqual(session.cancelled, [])
+                    self.assertEqual(len(self.dials), dials)
+                finally:
+                    for task in (closing, requested):
+                        task.cancel()
+                    await asyncio.gather(closing, requested, return_exceptions=True)
+                    if client._connection_task is not None:
+                        await client._task_manager.cancel_task(client._connection_task)
+
     async def test_a_session_is_cancelled_rather_than_drained_when_left(self):
         """``moq.Client`` drains a session it exits cleanly, which cannot finish
         while the broadcast this transport publishes is still open: it times

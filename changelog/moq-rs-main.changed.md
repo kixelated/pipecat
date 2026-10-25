@@ -1,1 +1,2 @@
 - `MOQTransport` follows `moq-rs` main: the audio track name moves from `EncoderOutput` to `moq.audio.Producer`, and a barge-in drops the retired audio producer instead of finishing it, since a finished track now keeps its catalog rendition until the broadcast ends.
+- Client-mode disconnect finishes published tracks, requests a draining shutdown, and waits for its delivery result.
