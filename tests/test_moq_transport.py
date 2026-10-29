@@ -606,7 +606,7 @@ class TestMOQTransportInit(unittest.TestCase):
         track = MagicMock(name="transcript_stream")
         moq_mock.json.StreamProducer.return_value = track
         origin = MagicMock(name="publish_origin")
-        origin.create_broadcast.return_value = broadcast
+        origin.create_broadcast.return_value.broadcast = broadcast
         moq_mock.OriginProducer.return_value = origin
 
         transport = MOQTransport(params=params, host="localhost", port=4080)
@@ -627,13 +627,16 @@ class TestMOQTransportInit(unittest.TestCase):
     def test_transcript_track_created_synchronously(self):
         """Same constraint for the transcript JSON stream: ``send_message``
         on the output transport appends RTVI messages into it, and that can
-        happen before ``_run()`` finishes dialing. Compression is on (the
-        ``.z`` suffix)."""
+        happen before ``_run()`` finishes dialing. The track is compressed
+        (the ``.z`` suffix)."""
         transport, broadcast, track, moq_mock = self._make_transport()
         self.assertIs(transport._client._transcript_out, track)
-        broadcast.publish_track.assert_called_once_with("transcript.json.z")
+        broadcast.publish_track.assert_called_once_with(
+            "transcript.json.z", moq_mock.TrackInfo.return_value
+        )
+        moq_mock.TrackInfo.assert_called_once_with(compress=True)
         moq_mock.json.StreamProducer.assert_called_once_with(
-            broadcast, broadcast.publish_track.return_value, compression=True
+            broadcast, broadcast.publish_track.return_value
         )
 
     def test_audio_track_is_lazy(self):
@@ -650,20 +653,22 @@ class TestMOQTransportInit(unittest.TestCase):
         """moq-rs routes only announced broadcasts, and the announce
         belongs after the last track a configuration creates — with audio
         on, the audio track ``open_audio_track`` adds."""
-        transport, broadcast, _track, _moq = self._make_transport()
-        broadcast.announce.assert_not_called()
+        transport, _broadcast, _track, _moq = self._make_transport()
+        publication = transport._client._publication
+        publication.announce.assert_not_called()
         transport._client.open_audio_track(24000)
-        broadcast.announce.assert_called_once()
+        publication.announce.assert_called_once()
 
     def test_audio_off_announces_after_the_transcript_track(self):
         """With audio out disabled ``open_audio_track`` opens nothing, so the
         transcript is the last track and ``__init__`` announces — without
         this the peer can't route the transcript until a redial announces
         the rebuilt broadcast."""
-        transport, broadcast, _track, _moq = self._make_transport(audio_out_enabled=False)
-        broadcast.announce.assert_called_once()
+        transport, _broadcast, _track, _moq = self._make_transport(audio_out_enabled=False)
+        publication = transport._client._publication
+        publication.announce.assert_called_once()
         transport._client.open_audio_track(24000)
-        broadcast.announce.assert_called_once()
+        publication.announce.assert_called_once()
 
     def test_broadcast_paths_built_from_params(self):
         """``<namespace>/<participant_id>`` and ``<namespace>/<peer_id>``
@@ -2290,7 +2295,8 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         peer_broadcast.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
         peer_broadcast.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
-                [MagicMock(data=b"\x00\x01" * 160)], moq.Error.Audio("moq: cancelled")
+                [moq.audio.Frame(data=b"\x00\x01" * 160, timestamp=timedelta(0))],
+                moq.Error.Audio("moq: cancelled"),
             )
         )
         await client._forward_peer_audio(peer_broadcast)
@@ -2307,7 +2313,8 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         first.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
         first.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
-                [MagicMock(data=b"\x00\x01" * 160)], moq.Error.Audio("moq: cancelled")
+                [moq.audio.Frame(data=b"\x00\x01" * 160, timestamp=timedelta(0))],
+                moq.Error.Audio("moq: cancelled"),
             )
         )
         first.subscribe_track = AsyncMock(
@@ -2359,9 +2366,14 @@ class TestReceivedAudioCarriesMediaTime(unittest.IsolatedAsyncioTestCase):
         peer_broadcast.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
                 [
-                    SimpleNamespace(data=pcm, timestamp=timedelta(microseconds=1_000_000)),
-                    # A skipped group leaves a gap the timestamps keep.
-                    SimpleNamespace(data=pcm, timestamp=timedelta(microseconds=1_060_000)),
+                    moq.audio.Frame(data=pcm, timestamp=timedelta(microseconds=1_000_000)),
+                    # A skipped group is reported, and carries no PCM.
+                    moq.audio.Gap(
+                        timestamp=timedelta(microseconds=1_020_000),
+                        duration=timedelta(microseconds=40_000),
+                    ),
+                    # The timestamps keep the gap.
+                    moq.audio.Frame(data=pcm, timestamp=timedelta(microseconds=1_060_000)),
                 ],
                 moq.Error.Audio("moq: cancelled"),
             )
@@ -2507,7 +2519,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.broadcast = MagicMock(name="broadcast")
         self.moq.audio.Producer.side_effect = lambda *a, **k: MagicMock(name="audio_producer")
         origin = MagicMock(name="publish_origin")
-        origin.create_broadcast.return_value = self.broadcast
+        origin.create_broadcast.return_value.broadcast = self.broadcast
         self.moq.OriginProducer.return_value = origin
 
         params = MOQParams(audio_in_enabled=True, audio_out_enabled=True)
