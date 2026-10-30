@@ -1906,8 +1906,8 @@ class _FakeJsonStream:
         pass
 
 
-class _FakeAnnounced:
-    """Stands in for ``AnnouncedBroadcast``: resolves to a broadcast token at
+class _FakeFollowing:
+    """Stands in for ``Following``: resolves to a broadcast token at
     once, or never when ``broadcast`` is ``None``."""
 
     def __init__(self, broadcast):
@@ -1945,12 +1945,13 @@ class TestConsumePeer(unittest.IsolatedAsyncioTestCase):
         ``None`` never resolves. The last one repeats."""
         broadcasts = list(broadcasts) or ["peer-broadcast"]
         origin = MagicMock(name="subscribe_origin")
+        origin.consume.return_value = MagicMock(spec=moq.OriginConsumer)
 
         def announced(_path):
             broadcast = broadcasts.pop(0) if len(broadcasts) > 1 else broadcasts[0]
-            return _FakeAnnounced(broadcast)
+            return _FakeFollowing(broadcast)
 
-        origin.consume.return_value.announced_broadcast.side_effect = announced
+        origin.consume.return_value.follow.side_effect = announced
         return origin
 
     @staticmethod
@@ -2251,7 +2252,8 @@ class TestSubscribeRefusedAsPeerGone(unittest.IsolatedAsyncioTestCase):
         peer_broadcast.catalog = AsyncMock(side_effect=self.DROPPED)
         peer_broadcast.subscribe_track = AsyncMock(side_effect=self.DROPPED)
         origin = MagicMock(name="subscribe_origin")
-        origin.consume.return_value.announced_broadcast.side_effect = lambda _path: _FakeAnnounced(
+        origin.consume.return_value = MagicMock(spec=moq.OriginConsumer)
+        origin.consume.return_value.follow.side_effect = lambda _path: _FakeFollowing(
             peer_broadcast
         )
         with patch.object(moq_transport, "_PEER_DATA_GRACE_S", 0.05):
@@ -2339,7 +2341,8 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         )
         broadcasts = iter([first, fresh])
         origin = MagicMock(name="subscribe_origin")
-        origin.consume.return_value.announced_broadcast.side_effect = lambda _path: _FakeAnnounced(
+        origin.consume.return_value = MagicMock(spec=moq.OriginConsumer)
+        origin.consume.return_value.follow.side_effect = lambda _path: _FakeFollowing(
             next(broadcasts)
         )
         gone = await asyncio.wait_for(client._consume_peer(origin), timeout=2)
