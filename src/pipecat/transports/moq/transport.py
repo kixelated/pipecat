@@ -1562,7 +1562,7 @@ class MOQTransportClient:
         retried = False
         while True:
             logger.debug(f"MOQ: waiting for peer broadcast {self._peer_broadcast_path!r}")
-            announced = self._track(consumer.announced_broadcast(self._peer_broadcast_path))
+            announced = self._track(consumer.follow(self._peer_broadcast_path))
             try:
                 peer_broadcast = await asyncio.wait_for(
                     announced.available(), timeout=max(self._peer_wait_remaining(), 0)
