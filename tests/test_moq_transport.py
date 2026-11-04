@@ -634,7 +634,7 @@ class TestMOQTransportInit(unittest.TestCase):
         broadcast.publish_track.assert_called_once_with(
             "transcript.json.z", moq_mock.TrackInfo.return_value
         )
-        moq_mock.TrackInfo.assert_called_once_with(compress=True)
+        moq_mock.TrackInfo.assert_called_once_with(compress=True, timescale=1_000)
         moq_mock.json.StreamProducer.assert_called_once_with(
             broadcast, broadcast.publish_track.return_value
         )
@@ -996,6 +996,8 @@ def _client_with_fake_moq(params: MOQParams | None = None, url: str = "https://r
     ):
         origin_cls.return_value.create_broadcast.return_value = MagicMock(name="broadcast")
         client = MOQTransportClient(params=params, url=url, bind=None, callbacks=callbacks)
+    # The mock broadcast has no clock: stamp every record at the epoch.
+    client._broadcast_now = lambda: moq.Timestamp(0, 1_000)
     return client, stream
 
 
@@ -2297,7 +2299,11 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         peer_broadcast.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
         peer_broadcast.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
-                [moq.audio.Frame(data=b"\x00\x01" * 160, timestamp=timedelta(0))],
+                [
+                    moq.audio.Frame(
+                        data=b"\x00\x01" * 160, timestamp=moq.Timestamp.from_timedelta(timedelta(0))
+                    )
+                ],
                 moq.Error.Audio("moq: cancelled"),
             )
         )
@@ -2315,7 +2321,11 @@ class TestTrackCancelledAsPeerGone(unittest.IsolatedAsyncioTestCase):
         first.catalog = AsyncMock(return_value=_FakeCatalogs([_opus_catalog()]))
         first.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
-                [moq.audio.Frame(data=b"\x00\x01" * 160, timestamp=timedelta(0))],
+                [
+                    moq.audio.Frame(
+                        data=b"\x00\x01" * 160, timestamp=moq.Timestamp.from_timedelta(timedelta(0))
+                    )
+                ],
                 moq.Error.Audio("moq: cancelled"),
             )
         )
@@ -2369,14 +2379,20 @@ class TestReceivedAudioCarriesMediaTime(unittest.IsolatedAsyncioTestCase):
         peer_broadcast.audio = AsyncMock(
             return_value=_FakeTrackEndingWith(
                 [
-                    moq.audio.Frame(data=pcm, timestamp=timedelta(microseconds=1_000_000)),
+                    moq.audio.Frame(
+                        data=pcm,
+                        timestamp=moq.Timestamp.from_timedelta(timedelta(microseconds=1_000_000)),
+                    ),
                     # A skipped group is reported, and carries no PCM.
                     moq.audio.Gap(
-                        timestamp=timedelta(microseconds=1_020_000),
+                        timestamp=moq.Timestamp.from_timedelta(timedelta(microseconds=1_020_000)),
                         duration=timedelta(microseconds=40_000),
                     ),
                     # The timestamps keep the gap.
-                    moq.audio.Frame(data=pcm, timestamp=timedelta(microseconds=1_060_000)),
+                    moq.audio.Frame(
+                        data=pcm,
+                        timestamp=moq.Timestamp.from_timedelta(timedelta(microseconds=1_060_000)),
+                    ),
                 ],
                 moq.Error.Audio("moq: cancelled"),
             )
@@ -2579,8 +2595,9 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.client.restart_audio_track()
         await self.client.publish_audio(b"\x00" * 320)
 
-        anchor = self.moq.audio.Frame.call_args.kwargs["timestamp"]
-        self.assertAlmostEqual(anchor, timedelta(seconds=25), delta=timedelta(milliseconds=100))
+        anchor = self.moq.Timestamp.call_args.args
+        self.assertEqual(anchor[1], 1_000_000)
+        self.assertAlmostEqual(anchor[0], 25_000_000, delta=100_000)
         self.client._audio_out.reanchor.assert_called_once()
 
     def test_restart_without_audio_in_flight_keeps_the_track(self):

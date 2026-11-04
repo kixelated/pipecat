@@ -812,9 +812,13 @@ class MOQTransportClient:
         behind on.
         """
         track = self._publish_broadcast.publish_track(
-            self._params.transcript_track, moq.TrackInfo(compress=True)
+            self._params.transcript_track, moq.TrackInfo(compress=True, timescale=1_000)
         )
         return moq.json.StreamProducer(self._publish_broadcast, track)
+
+    def _broadcast_now(self) -> "moq.Timestamp":
+        """The publish broadcast's clock, which every transcript record is stamped on."""
+        return moq.media.CatalogProducer(self._publish_broadcast).now()
 
     def _publish_audio_track(self, sample_rate: int) -> "moq.audio.Producer":
         """Open the bot's Opus audio track on the current publish broadcast."""
@@ -875,7 +879,7 @@ class MOQTransportClient:
         try:
             replayed = 0
             while replayed < len(self._transcript_log):
-                self._transcript_out.append(self._transcript_log[replayed])
+                self._transcript_out.append(self._transcript_log[replayed], self._broadcast_now())
                 replayed += 1
                 if replayed % _TRANSCRIPT_REPLAY_SLICE == 0:
                     await asyncio.sleep(0)
@@ -1015,7 +1019,7 @@ class MOQTransportClient:
             + self._publish_epoch_samples * 1_000_000 // self._audio_out_sample_rate
         )
         self._audio_out.write(
-            moq.audio.Frame(timestamp=timedelta(microseconds=self._publish_pts_us), data=audio)
+            moq.audio.Frame(timestamp=moq.Timestamp(self._publish_pts_us, 1_000_000), data=audio)
         )
         self._publish_pts_us += int(duration_s * 1_000_000)
         self._publish_epoch_samples += len(audio) // 2
@@ -1064,7 +1068,7 @@ class MOQTransportClient:
         self._next_seq += 1
         self._transcript_log.append(record)
         if not self._transcript_replaying:
-            self._transcript_out.append(record)
+            self._transcript_out.append(record, self._broadcast_now())
 
     @property
     def cert_fingerprints(self) -> list[str]:
@@ -1747,7 +1751,9 @@ class MOQTransportClient:
                         format=moq.audio.SampleFormat.S16,
                         sample_rate=target_rate,
                         channels=source_channels,
-                        max_delay=timedelta(milliseconds=self._params.audio_in_max_latency_ms),
+                        delay=moq.Delay(
+                            max=timedelta(milliseconds=self._params.audio_in_max_latency_ms)
+                        ),
                     ),
                 )
             )
@@ -1760,7 +1766,9 @@ class MOQTransportClient:
                     if source_channels > 1:
                         pcm = _downmix_s16_to_mono(pcm, source_channels)
                     await self._callbacks.on_audio_received(
-                        pcm, target_rate, frame.timestamp // timedelta(microseconds=1)
+                        pcm,
+                        target_rate,
+                        frame.timestamp.value * 1_000_000 // frame.timestamp.scale,
                     )
         except asyncio.CancelledError:
             pass
