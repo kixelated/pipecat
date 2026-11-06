@@ -649,18 +649,17 @@ class MOQTransportClient:
         # Owned for the lifetime of this client. Created synchronously so
         # MOQOutputTransport.start() can publish_audio + write transcript
         # frames without racing with _run()'s async bring-up.
-        # The publication announces; its broadcast carries the tracks.
-        self._publication: moq.Publication = self._publish_origin.create_broadcast(
-            self._broadcast_path
-        )
-        self._publish_broadcast: moq.BroadcastProducer = self._publication.broadcast
+        # The route announces; its broadcast carries the tracks. Created
+        # hidden so the tracks exist before readers can find it.
+        self._route: moq.Route = self._publish_origin.route(self._broadcast_path, hidden=True)
+        self._publish_broadcast: moq.BroadcastProducer = self._route.broadcast
         self._transcript_out: moq.json.StreamProducer = self._open_transcript()
         # moq-rs routes only announced broadcasts, and the announce
         # belongs after the last track a configuration creates. Audio off:
         # transcript is that track, announce now. Audio on:
         # ``open_audio_track`` announces after adding the audio track.
         if not params.audio_out_enabled:
-            self._publication.announce()
+            self._route.announce()
         # Audio track is opened lazily once the pipeline's output sample
         # rate is known (in :meth:`open_audio_track`). We stash the rate
         # because ``publish_audio`` uses it to convert byte length to
@@ -793,7 +792,7 @@ class MOQTransportClient:
         # Announce broadcast to peers now that subscriber-needed tracks exist
         # (catalog via audio rendition above, transcript stream). moq-rs
         # requires explicit announce; until announced, broadcast is unroutable.
-        self._publication.announce()
+        self._route.announce()
 
     @property
     def _audio_track_name(self) -> str:
@@ -862,8 +861,8 @@ class MOQTransportClient:
         # best-effort tidiness.
         self._finish_published()
         self._publish_origin = moq.OriginProducer()
-        self._publication = self._publish_origin.create_broadcast(self._broadcast_path)
-        self._publish_broadcast = self._publication.broadcast
+        self._route = self._publish_origin.route(self._broadcast_path, hidden=True)
+        self._publish_broadcast = self._route.broadcast
         self._transcript_out = self._open_transcript()
         self._audio_out = None
         self._publish_epoch_us = None
@@ -871,7 +870,7 @@ class MOQTransportClient:
             self._audio_out = self._publish_audio_track(self._audio_out_sample_rate)
         # Re-announce rebuilt broadcast (moq-rs requires explicit
         # announce; see open_audio_track).
-        self._publication.announce()
+        self._route.announce()
         # By index against the live log: a record published while the
         # replay yields is only logged (see publish_transcript), and is
         # written from here, after the records before it.

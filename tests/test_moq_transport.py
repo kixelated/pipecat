@@ -606,7 +606,7 @@ class TestMOQTransportInit(unittest.TestCase):
         track = MagicMock(name="transcript_stream")
         moq_mock.json.StreamProducer.return_value = track
         origin = MagicMock(name="publish_origin")
-        origin.create_broadcast.return_value.broadcast = broadcast
+        origin.route.return_value.broadcast = broadcast
         moq_mock.OriginProducer.return_value = origin
 
         transport = MOQTransport(params=params, host="localhost", port=4080)
@@ -620,8 +620,8 @@ class TestMOQTransportInit(unittest.TestCase):
         self.assertIs(transport._client._publish_broadcast, broadcast)
         # Created at its final path: the origin carries the broadcast into the
         # session, so there is no later attach step to forget.
-        transport._client._publish_origin.create_broadcast.assert_called_once_with(
-            transport._client._broadcast_path
+        transport._client._publish_origin.route.assert_called_once_with(
+            transport._client._broadcast_path, hidden=True
         )
 
     def test_transcript_track_created_synchronously(self):
@@ -949,7 +949,7 @@ class TestIsNormalClose(unittest.TestCase):
 def _fake_origin(**_kwargs):
     """A stand-in ``moq.OriginProducer`` whose broadcast is a mock."""
     origin = MagicMock(name="origin")
-    origin.create_broadcast.return_value = MagicMock(name="broadcast")
+    origin.route.return_value = MagicMock(name="broadcast")
     return origin
 
 
@@ -994,7 +994,7 @@ def _client_with_fake_moq(params: MOQParams | None = None, url: str = "https://r
         patch.object(moq_transport.moq, "OriginProducer") as origin_cls,
         patch.object(moq_transport.moq.json, "StreamProducer", return_value=stream),
     ):
-        origin_cls.return_value.create_broadcast.return_value = MagicMock(name="broadcast")
+        origin_cls.return_value.route.return_value = MagicMock(name="broadcast")
         client = MOQTransportClient(params=params, url=url, bind=None, callbacks=callbacks)
     # The mock broadcast has no clock: stamp every record at the epoch.
     client._broadcast_now = lambda: moq.Timestamp(0, 1_000)
@@ -2538,7 +2538,7 @@ class TestMOQAudioTrackRestart(unittest.IsolatedAsyncioTestCase):
         self.broadcast = MagicMock(name="broadcast")
         self.moq.audio.Producer.side_effect = lambda *a, **k: MagicMock(name="audio_producer")
         origin = MagicMock(name="publish_origin")
-        origin.create_broadcast.return_value.broadcast = self.broadcast
+        origin.route.return_value.broadcast = self.broadcast
         self.moq.OriginProducer.return_value = origin
 
         params = MOQParams(audio_in_enabled=True, audio_out_enabled=True)
