@@ -811,7 +811,8 @@ class MOQTransportClient:
         behind on.
         """
         track = self._publish_broadcast.publish_track(
-            self._params.transcript_track, moq.TrackInfo(compress=True, timescale=1_000)
+            self._params.transcript_track,
+            moq.TrackInfo(compression=moq.Compression.DEFLATE, timescale=1_000),
         )
         return moq.json.StreamProducer(self._publish_broadcast, track)
 

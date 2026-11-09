@@ -634,7 +634,9 @@ class TestMOQTransportInit(unittest.TestCase):
         broadcast.publish_track.assert_called_once_with(
             "transcript.json.z", moq_mock.TrackInfo.return_value
         )
-        moq_mock.TrackInfo.assert_called_once_with(compress=True, timescale=1_000)
+        moq_mock.TrackInfo.assert_called_once_with(
+            compression=moq_mock.Compression.DEFLATE, timescale=1_000
+        )
         moq_mock.json.StreamProducer.assert_called_once_with(
             broadcast, broadcast.publish_track.return_value
         )
