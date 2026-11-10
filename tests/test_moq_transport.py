@@ -656,7 +656,7 @@ class TestMOQTransportInit(unittest.TestCase):
         belongs after the last track a configuration creates — with audio
         on, the audio track ``open_audio_track`` adds."""
         transport, _broadcast, _track, _moq = self._make_transport()
-        publication = transport._client._publication
+        publication = transport._client._route
         publication.announce.assert_not_called()
         transport._client.open_audio_track(24000)
         publication.announce.assert_called_once()
@@ -667,7 +667,7 @@ class TestMOQTransportInit(unittest.TestCase):
         this the peer can't route the transcript until a redial announces
         the rebuilt broadcast."""
         transport, _broadcast, _track, _moq = self._make_transport(audio_out_enabled=False)
-        publication = transport._client._publication
+        publication = transport._client._route
         publication.announce.assert_called_once()
         transport._client.open_audio_track(24000)
         publication.announce.assert_called_once()
@@ -1275,10 +1275,14 @@ class _FakeSession:
             self._closed.set()
 
     def state(self):
-        return SimpleNamespace(phase=moq.ConnectionPhase.CONNECTING, revision=0)
+        return SimpleNamespace(phase=moq.ConnectionPhase.CONNECTING(failure=None), revision=0)
 
     async def state_changed(self, after: int):
-        phase = moq.ConnectionPhase.CLOSED if self._refused else moq.ConnectionPhase.CONNECTED
+        phase = (
+            moq.ConnectionPhase.CLOSED(failure=None)
+            if self._refused
+            else moq.ConnectionPhase.CONNECTED(version="moq-lite-03")
+        )
         return SimpleNamespace(phase=phase, revision=after + 1)
 
     def cancel(self, code: int):

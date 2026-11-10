@@ -1349,9 +1349,9 @@ class MOQTransportClient:
         ``closed()`` raises the failure (a refused token among them).
         """
         state = session.state()
-        while state.phase == moq.ConnectionPhase.CONNECTING:
+        while isinstance(state.phase, moq.ConnectionPhase.CONNECTING):
             state = await session.state_changed(state.revision)
-        if state.phase == moq.ConnectionPhase.CONNECTED:
+        if isinstance(state.phase, moq.ConnectionPhase.CONNECTED):
             return
         await session.closed()
         raise ConnectionError(f"MOQ: session closed before connecting ({state.phase})")
