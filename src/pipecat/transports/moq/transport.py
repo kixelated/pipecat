@@ -88,7 +88,6 @@ _LEGACY_UNAUTHORIZED_CODE = 6
 _NORMAL_CLOSE_KINDS = frozenset(
     {
         moq.ProtocolKind.CANCEL,
-        moq.ProtocolKind.SESSION_CLOSED,
         moq.ProtocolKind.GOING_AWAY,
     }
 )

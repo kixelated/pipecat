@@ -2439,7 +2439,6 @@ class TestIsUnauthorized(unittest.TestCase):
         for kind, code, message in (
             (moq.ProtocolKind.PROTOCOL_VIOLATION, 3, "transport"),
             (moq.ProtocolKind.CANCEL, 0, "remote err"),
-            (moq.ProtocolKind.SESSION_CLOSED, 9, "closed"),
         ):
             with self.subTest(kind=kind):
                 details = moq.ProtocolError(
